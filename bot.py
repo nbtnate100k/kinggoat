@@ -1,0 +1,3587 @@
+"""
+Goatys CC — Telegram shop bot (balance, BIN stock, BTC/LTC/Cash App top-up).
+"""
+from __future__ import annotations
+
+import asyncio
+import html
+import io
+import json
+import logging
+import os
+import re
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from aiohttp import web
+from dotenv import load_dotenv
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    Update,
+    User,
+)
+from telegram.error import Conflict
+from telegram.ext import (
+    Application,
+    ApplicationHandlerStop,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# Resolve next to bot.py so .env loads even when cwd is not the repo root.
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger(__name__)
+
+CAPTION = """♨️ Daily Restocks Every Day No Stop We Some Fucking Goats 🐐
+
+♨️ Convenient Deposit Via Btc, Ltc and other payments contact support
+
+♨️ Support Will Help You 24/7 🐐
+
+COUNTRY LIST: 🇺🇸 🇫🇷 🇨🇦 🇩🇪 🇪🇸 🇦🇪 🇮🇱 🇨🇴 🇲🇽 🇨🇱 🇯🇵 🇵🇭 and many more
+
+⚜️ Have a good day with Goatys Cause We The Fucking 🐐⚜️"""
+
+USERS: dict[int, dict[str, Any]] = {}
+
+
+def _env_wallet(key: str, fallback: str = "") -> str:
+    return (os.getenv(key) or "").strip() or fallback
+
+
+# Unified balance + one BTC/LTC pair (fallbacks absorb older per-base env names).
+CLAIM_BALANCE_BUCKET = "shop"
+
+WALLET_BTC = _env_wallet(
+    "BTC_WALLET",
+    _env_wallet("BASE_MONEYJR_BTC", _env_wallet("BASE_GTJM_BTC")),
+).strip()
+WALLET_LTC = _env_wallet(
+    "LTC_WALLET",
+    _env_wallet("BASE_MONEYJR_LTC", _env_wallet("BASE_GTJM_LTC")),
+).strip()
+
+
+def shop_deposit_addresses() -> dict[str, str]:
+    return {
+        "btc": WALLET_BTC or "— set BTC_WALLET or BASE_*_BTC in .env —",
+        "ltc": WALLET_LTC or "— set LTC_WALLET or BASE_*_LTC in .env —",
+    }
+
+
+# Older bin_stock.json nested buckets (migrate into single catalog).
+_STOCK_LEGACY_BASE_KEYS: frozenset[str] = frozenset(
+    {"blackjack", "moneyjr", "uhq_usa", "foreign_rfc", "jr", "tony"}
+)
+
+
+def _token_norm_shop(s: str) -> str:
+    return str(s).strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _consume_optional_legacy_stock_slug(
+    parts: list[str], idx: int
+) -> tuple[int, str | None]:
+    """After ``bin``, skip one old bucket label when present."""
+    if idx >= len(parts):
+        return idx, None
+    if _token_norm_shop(parts[idx]) not in _STOCK_LEGACY_BASE_KEYS:
+        return idx, None
+    leg = html.escape(str(parts[idx])[:80])
+    return idx + 1, (
+        f"\n<i>Ignored legacy slug <code>{leg}</code> — inventory is unified.</i>"
+    )
+
+
+def legacy_payment_claim_label(_key: str | None = None) -> str:
+    return "Shop balance"
+
+ROOT_DIR = Path(__file__).resolve().parent
+DATA_DIR = ROOT_DIR / "data"
+ASSETS_DIR = ROOT_DIR / "assets"
+# Public Telegram channel (invite link)
+GOATYS_CHANNEL_URL = "https://t.me/addlist/11dfOn2Yf7JlNzZh"
+SUPPORT_TELEGRAM_URL = "https://t.me/Blackjack_Swipes"
+
+# Main chat reply keyboard (persistent bottom bar — not the same as inline buttons).
+BTN_REPLY_TOPUP = "💰 Top-up Balance"
+BTN_REPLY_BUY = "🛒 Buy Cards"
+BTN_REPLY_ORDERS = "📦 My Orders"
+BTN_REPLY_CHANNEL = "📣 Channel"
+BTN_REPLY_SUPPORT = "💬 Support"
+BTN_REPLY_ADMIN = "🔧 Admin panel"
+KNOWN_USERS_PATH = DATA_DIR / "known_users.json"
+ORDERS_PATH = DATA_DIR / "user_orders.json"
+PAYMENTS_PATH = DATA_DIR / "payments.json"
+STOCK_PATH = DATA_DIR / "stock_tiers.json"  # legacy; migrated to bin_stock.json once
+BIN_STOCK_PATH = DATA_DIR / "bin_stock.json"
+# Section keys: "377935:live" or "377935:unchecked" (BIN + inventory pile).
+BIN_SECTIONS: dict[str, dict[str, Any]] = {}
+
+PILE_LIVE = "live"
+PILE_UNCHECKED = "unchecked"
+PILE_ORDER: dict[str, int] = {PILE_LIVE: 0, PILE_UNCHECKED: 1}
+VALID_PILES: frozenset[str] = frozenset({PILE_LIVE, PILE_UNCHECKED})
+
+
+def normalize_section_id(key: str) -> str | None:
+    """Canonical section id BIN:live|unchecked, or None."""
+    k = str(key).strip()
+    if len(k) == 6 and k.isdigit():
+        return f"{k}:{PILE_LIVE}"
+    if ":" in k:
+        a, b = k.split(":", 1)
+        a = "".join(c for c in a if c.isdigit())[:6]
+        b = b.strip().lower()
+        if len(a) == 6 and b in VALID_PILES:
+            return f"{a}:{b}"
+    return None
+
+
+def section_id_to_slug(sid: str) -> str:
+    """Stable for callback_data — BIN uses only digits."""
+    n = normalize_section_id(sid)
+    sid = n or sid
+    if ":" in sid:
+        b, p = sid.split(":", 1)
+        return f"{b}-{p.lower()}"
+    return sid
+
+
+def slug_to_section_id(slug: str) -> str | None:
+    slug = slug.strip()
+    if not slug:
+        return None
+    if slug.isdigit() and len(slug) == 6:
+        return f"{slug}:{PILE_LIVE}"
+    if "-" in slug:
+        b, pile = slug.split("-", 1)
+        pile = pile.strip().lower()
+        b = "".join(c for c in b if c.isdigit())[:6]
+        if len(b) == 6 and pile in VALID_PILES:
+            return f"{b}:{pile}"
+    return normalize_section_id(slug)
+
+
+def section_title_html(section_id: str) -> str:
+    """Heading for buyers/admins."""
+    nid = normalize_section_id(section_id) or section_id
+    if ":" in nid:
+        b, pile = nid.split(":", 1)
+        pile_lbl = pile.replace("_", " ").upper()
+        return f"{html.escape(b)} · {html.escape(pile_lbl)}"
+    return html.escape(nid)
+
+
+def section_sort_key(sid: str) -> tuple[str, int]:
+    n = normalize_section_id(sid)
+    if not n:
+        return ("999999", 99)
+    b, p = n.split(":", 1)
+    return (b, PILE_ORDER.get(p, 9))
+
+_LEGACY_TIER_PRICES: dict[str, float] = {
+    "random": 5.0,
+    "70": 10.0,
+    "80": 15.0,
+    "90": 20.0,
+    "100": 25.0,
+}
+
+CORS_HEADERS: dict[str, str] = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, X-Leadbot-Secret",
+}
+
+
+def _parse_admin_ids() -> set[int]:
+    """Comma-separated numeric Telegram user IDs (from @userinfobot). No @username."""
+    raw = (os.getenv("ADMIN_USER_IDS", "") or "").strip()
+    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+        raw = raw[1:-1].strip()
+    out: set[int] = set()
+    for part in raw.replace(";", ",").split(","):
+        p = part.strip().strip('"').strip("'").replace(" ", "")
+        if not p:
+            continue
+        try:
+            out.add(int(p))
+        except ValueError:
+            log.warning("Invalid ADMIN_USER_IDS entry: %s", part)
+    return out
+
+
+ADMIN_USER_IDS: set[int] = _parse_admin_ids()
+
+LEADBOT_API_SECRET: str = os.getenv("LEADBOT_API_SECRET", "").strip()
+
+
+def bin_sections_all() -> dict[str, dict[str, Any]]:
+    """Single merged catalog."""
+    load_bin_stock()
+    return BIN_SECTIONS
+
+
+def bin_sections_for_base(_base_unused: str | None = None) -> dict[str, dict[str, Any]]:
+    """Back-compat name; ignores base — one catalog for everyone."""
+    return bin_sections_all()
+
+
+def _ingest_section_dict(v: Any) -> dict[str, Any] | None:
+    if not isinstance(v, dict):
+        return None
+    lines = v.get("lines")
+    if not isinstance(lines, list):
+        return None
+    raw_pile = str(v.get("pile") or "").strip().lower()
+    pile = raw_pile if raw_pile in VALID_PILES else PILE_LIVE
+    sec = {
+        "price_usd": float(v.get("price_usd", 0.0)),
+        "lines": [str(x) for x in lines],
+        "listing_notes": str(v.get("listing_notes") or "")[:2000],
+        "pile": pile,
+    }
+    sort_stock_lines(sec["lines"])
+    return sec
+
+
+def _merge_section_into(
+    bucket: dict[str, dict[str, Any]],
+    section_id: str,
+    sec_new: dict[str, Any],
+) -> None:
+    """Merge into one pile section (same section_id only)."""
+    sid = normalize_section_id(section_id) or section_id
+    if sid not in bucket:
+        bucket[sid] = {
+            "price_usd": float(sec_new.get("price_usd", 0.0)),
+            "lines": list(sec_new.get("lines") or []),
+            "listing_notes": str(sec_new.get("listing_notes") or "")[:2000],
+            "pile": str(sec_new.get("pile") or PILE_LIVE),
+        }
+        sort_stock_lines(bucket[sid]["lines"])
+        return
+    dest = bucket[sid]
+    dest["price_usd"] = max(
+        float(dest.get("price_usd", 0.0)),
+        float(sec_new.get("price_usd", 0.0)),
+    )
+    ln = dest.setdefault("lines", [])
+    ln.extend(sec_new.get("lines") or [])
+    sort_stock_lines(ln)
+    nn = str(sec_new.get("listing_notes") or "").strip()
+    if nn:
+        cur = str(dest.get("listing_notes") or "").strip()
+        dest["listing_notes"] = nn if not cur else f"{cur}\n{nn}".strip()
+        dest["listing_notes"] = dest["listing_notes"][:2000]
+
+
+def load_bin_stock() -> None:
+    global BIN_SECTIONS
+    BIN_SECTIONS = {}
+    if not BIN_STOCK_PATH.is_file():
+        if STOCK_PATH.is_file():
+            _migrate_legacy_stock_tiers_to_bin_sections()
+        return
+    try:
+        raw = json.loads(BIN_STOCK_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return
+
+        merged: dict[str, dict[str, Any]] = {}
+        nested = False
+        for key in raw:
+            key_s = str(key)
+            sub = raw.get(key)
+            if key_s in _STOCK_LEGACY_BASE_KEYS and isinstance(sub, dict) and sub:
+                sample = next(iter(sub.values()))
+                if isinstance(sample, dict) and isinstance(sample.get("lines"), list):
+                    nested = True
+                    break
+
+        rewrite_file = False
+        if nested:
+            rewrite_file = True
+            for key in sorted(raw.keys()):
+                key_s = str(key)
+                if key_s not in _STOCK_LEGACY_BASE_KEYS:
+                    continue
+                sub = raw.get(key)
+                if not isinstance(sub, dict):
+                    continue
+                for k, v in sub.items():
+                    bk = str(k).strip()[:6]
+                    if len(bk) != 6 or not bk.isdigit():
+                        continue
+                    sec = _ingest_section_dict(v)
+                    if sec:
+                        _merge_section_into(merged, f"{bk}:{PILE_LIVE}", sec)
+            log.info(
+                "Merged nested bin_stock.json bases into unified catalog (%s sections).",
+                len(merged),
+            )
+        else:
+            for key in raw:
+                ks = str(key).strip()
+                if len(ks) == 6 and ks.isdigit():
+                    rewrite_file = True
+                    break
+            for key, v in raw.items():
+                sid = normalize_section_id(str(key).strip())
+                if not sid:
+                    continue
+                sec = _ingest_section_dict(v)
+                if sec:
+                    _merge_section_into(merged, sid, sec)
+            legacy_jr_tony = any(
+                str(k).strip().lower() in ("jr", "tony") for k in raw
+            )
+            if legacy_jr_tony:
+                rewrite_file = True
+
+        BIN_SECTIONS = merged
+        if rewrite_file and merged:
+            log.info(
+                "Rewrote bin_stock.json to flat unified schema (BIN → section)."
+            )
+            save_bin_stock()
+    except (OSError, ValueError, TypeError) as e:
+        log.warning("Could not load bin stock: %s", e)
+
+
+def save_bin_stock() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    out: dict[str, Any] = {}
+    for bk, sec in sorted(BIN_SECTIONS.items()):
+        nid = normalize_section_id(bk) or bk
+        pile = nid.split(":", 1)[1] if ":" in nid else PILE_LIVE
+        out[nid] = {
+            "price_usd": float(sec.get("price_usd", 0.0)),
+            "lines": list(sec.get("lines") or []),
+            "listing_notes": str(sec.get("listing_notes") or "")[:2000],
+            "pile": pile,
+        }
+    BIN_STOCK_PATH.write_text(
+        json.dumps(out, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _migrate_legacy_stock_tiers_to_bin_sections() -> None:
+    global BIN_SECTIONS
+    BIN_SECTIONS = {}
+    try:
+        raw = json.loads(STOCK_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as e:
+        log.warning("Legacy stock migrate: %s", e)
+        return
+    if not isinstance(raw, dict):
+        return
+    for tid, price in _LEGACY_TIER_PRICES.items():
+        tier_obj = raw.get(tid)
+        if not isinstance(tier_obj, dict):
+            continue
+        for bin_key, lines in tier_obj.items():
+            if not isinstance(lines, list):
+                continue
+            bk = str(bin_key).strip()[:6]
+            if len(bk) != 6 or not bk.isdigit():
+                continue
+            sec = BIN_SECTIONS.setdefault(
+                f"{bk}:{PILE_LIVE}",
+                {"price_usd": float(price), "lines": [], "listing_notes": "", "pile": PILE_LIVE},
+            )
+            for line in lines:
+                sec["lines"].append(str(line))
+            sec["price_usd"] = max(float(sec["price_usd"]), float(price))
+    for sec in BIN_SECTIONS.values():
+        sort_stock_lines(sec["lines"])
+    save_bin_stock()
+    log.info("Migrated %s to bin_stock.json", STOCK_PATH)
+
+
+def group_lines_by_card_bin(lines: list[str]) -> dict[str, list[str]]:
+    groups: dict[str, list[str]] = {}
+    for line in lines:
+        b = extract_bin_prefix_from_line(line) or "000000"
+        groups.setdefault(b, []).append(line)
+    return groups
+
+
+# Short: PAN MM/YY CVV (spaces)
+_STOCK_SHORT_LINE_RE = re.compile(
+    r"^\s*(\d{13,19})\s+(\d{1,2})/(\d{2,4})\s+(\d{3,4})\s*$"
+)
+
+# Cash App cashtag body (after $); conservative charset.
+_CASHTAG_BODY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,29}$")
+
+
+def parse_stock_line_to_pipe(
+    raw: str, section_bin: str
+) -> tuple[str | None, str | None]:
+    """Return (pipe_line, error) — error set if line invalid."""
+    s = raw.strip()
+    if not s:
+        return None, None
+    section_bin = section_bin.strip()[:6]
+    if len(section_bin) != 6 or not section_bin.isdigit():
+        return None, "Invalid section BIN"
+    if "|" in s:
+        parts = [p.strip() for p in s.split("|")]
+        if len(parts) < 4:
+            return None, "Pipe line needs at least card|mm|yy|cvv"
+        pan = "".join(c for c in parts[0] if c.isdigit())
+        if len(pan) < 13:
+            return None, "Invalid PAN (pipe)"
+        if pan[:6] != section_bin:
+            return (
+                None,
+                f"Card BIN {pan[:6]} must match section {section_bin}",
+            )
+        return "|".join(parts), None
+    m = _STOCK_SHORT_LINE_RE.match(s)
+    if not m:
+        return (
+            None,
+            "Use short <code>PAN MM/YY CVV</code> or a full <code>|</code> line",
+        )
+    pan, mm, yy, cvv = m.groups()
+    if pan[:6] != section_bin:
+        return (
+            None,
+            f"Card BIN {pan[:6]} must match section {section_bin}",
+        )
+    mm = mm.zfill(2)
+    yy = yy.strip()
+    if len(yy) == 4:
+        yy = yy[2:]
+    yy = yy.zfill(2)[:2]
+    line = f"{pan}|{mm}|{yy}|{cvv}|?|?|?|?|?|US|?|?|?"
+    return line, None
+
+
+def clear_admin_stock_flow(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int | None = None
+) -> None:
+    for k in (
+        "admin_stock_step",
+        "stock_flow_bin",
+        "stock_flow_pile",
+        "stock_flow_price",
+        "stock_flow_batch_label",
+        "stock_flow_section_id",
+        "stock_flow_pending_lines",
+    ):
+        context.user_data.pop(k, None)
+    if user_id is not None:
+        clear_admin_stock_wizard(int(user_id))
+
+
+def admin_stock_reply_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📦 Add stock",
+                    callback_data="adm_stock",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ Cancel wizard",
+                    callback_data="adm_stock_cancel",
+                )
+            ],
+        ]
+    )
+
+
+def admin_stock_wizard_step1_intro() -> str:
+    return (
+        "📦 <b>Add stock — step 1/5</b>\n\n"
+        "Send the <b>6-digit BIN</b> for this upload "
+        "(e.g. <code>377935</code>). You will choose <b>Live</b> vs <b>Unchecked</b>, "
+        "price, tag, paste lines, then <code>/done</code> commits."
+    )
+
+
+def admin_stock_pile_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Live pile", callback_data="adm_stkpile:live"),
+                InlineKeyboardButton(
+                    "📋 Unchecked pile",
+                    callback_data="adm_stkpile:unchecked",
+                ),
+            ],
+        ]
+    )
+
+
+def stock_buffer_started_html(
+    price: float, bin6: str, pile: str, batch_tag: str
+) -> str:
+    pt = html.escape(pile.strip().upper())
+    tag_e = html.escape(batch_tag.strip() or "Goatys🐐")
+    bk_e = html.escape(bin6.strip()[:6])
+    return (
+        f"📥 <b>Stock upload started</b> — {fmt_usd(price)} → {tag_e}\n"
+        f"📂 <b>Pile:</b> {pt} · <b>BIN</b> <code>{bk_e}</code>\n\n"
+        "<b>Buffered</b> <code>0</code> line(s) so far.\n\n"
+        "Telegram often splits long pastes into several messages — "
+        "<b>keep pasting every part here.</b>\n\n"
+        "⚠️ Nothing is added to the shop until you send <code>/done</code> "
+        "(that commits the full batch).\n"
+        "<code>/cancelstock</code> / <code>/cancel</code> to abort."
+    )
+
+
+def extract_bin_prefix_from_line(line: str) -> str | None:
+    """First pipe field = card number; first 6 digits = BIN (same as HTML sorter)."""
+    s = line.strip()
+    if not s:
+        return None
+    pipe = s.find("|")
+    if pipe == -1:
+        return None
+    card = s[:pipe].strip().strip('"').strip()
+    digits = "".join(c for c in card if c.isdigit())
+    if len(digits) < 6:
+        return None
+    return digits[:6]
+
+
+_SORT_MISSING = "\uffff"
+
+
+def extract_locality_bin_sort_key(line: str) -> tuple[str, str, str, str]:
+    """Order: state → city → ZIP → BIN (aligned with HTML sendout)."""
+    b = extract_bin_prefix_from_line(line) or "000000"
+    parts = line.split("|")
+    city = (parts[6] if len(parts) > 6 else "").strip().strip('"').lower()
+    state_raw = (parts[7] if len(parts) > 7 else "").strip().strip('"').upper()
+    # Full state token for order (avoids "North Carolina" → wrong 2-letter cut)
+    state = state_raw if state_raw else ""
+    zipc = (parts[8] if len(parts) > 8 else "").strip().strip('"')
+    return (
+        state if state else _SORT_MISSING,
+        city if city else _SORT_MISSING,
+        zipc if zipc else _SORT_MISSING,
+        b,
+    )
+
+
+def sort_stock_lines(lines: list[str]) -> None:
+    """In-place: state, city, ZIP; BIN identical within bucket."""
+    lines.sort(key=lambda ln: extract_locality_bin_sort_key(ln)[:3])
+
+
+def bin_bucket_catalog_sort_key(lines: list[str]) -> tuple[str, str, str, str]:
+    if not lines:
+        return (_SORT_MISSING, _SORT_MISSING, _SORT_MISSING, "000000")
+    tmp = list(lines)
+    sort_stock_lines(tmp)
+    return extract_locality_bin_sort_key(tmp[0])
+
+
+FILTER_KIND_ALL = 0
+FILTER_KIND_CREDIT = 1
+FILTER_KIND_DEBIT = 2
+FILTER_KIND_PREPAID = 3
+FILTER_KIND_CREDIT_UNION = 4
+FILTER_KIND_LABELS: tuple[tuple[str, int], ...] = (
+    ("All types", FILTER_KIND_ALL),
+    ("Credit", FILTER_KIND_CREDIT),
+    ("Debit", FILTER_KIND_DEBIT),
+    ("Prepaid", FILTER_KIND_PREPAID),
+    ("C/U", FILTER_KIND_CREDIT_UNION),
+)
+MAX_CAT_BANK_OPTIONS = 12
+MAX_CAT_LEVEL_OPTIONS = 10
+
+
+def _pipe_upper_field(line: str, idx: int) -> str:
+    parts = line.split("|")
+    return (parts[idx] if len(parts) > idx else "").strip().upper()
+
+
+def catalog_unique_banks_levels(lines: list[str]) -> tuple[list[str], list[str]]:
+    banks: dict[str, None] = {}
+    levels: dict[str, None] = {}
+    for ln in lines:
+        b = _pipe_upper_field(ln, 11)
+        if b and b not in ("?", "", "UNKNOWN"):
+            banks[b] = None
+        lv = _pipe_upper_field(ln, 13)
+        if lv and lv != "?":
+            levels[lv] = None
+    bl = sorted(banks.keys())[:MAX_CAT_BANK_OPTIONS]
+    ll = sorted(levels.keys())[:MAX_CAT_LEVEL_OPTIONS]
+    return bl, ll
+
+
+def line_matches_buy_filters(
+    line: str,
+    bank_i: int,
+    kind_k: int,
+    level_i: int,
+    bank_list: list[str],
+    level_list: list[str],
+) -> bool:
+    if bank_i > 0:
+        want = bank_list[bank_i - 1] if bank_i - 1 < len(bank_list) else ""
+        if want and _pipe_upper_field(line, 11) != want:
+            return False
+    if kind_k == FILTER_KIND_CREDIT:
+        if "CREDIT" not in _pipe_upper_field(line, 12):
+            return False
+    elif kind_k == FILTER_KIND_DEBIT:
+        if "DEBIT" not in _pipe_upper_field(line, 12):
+            return False
+    elif kind_k == FILTER_KIND_PREPAID:
+        slot = "|".join(_pipe_upper_field(line, i) for i in (12, 13))
+        if "PREPAID" not in slot:
+            return False
+    elif kind_k == FILTER_KIND_CREDIT_UNION:
+        if "CREDIT UNION" not in line.upper():
+            return False
+    if level_i > 0:
+        want = level_list[level_i - 1] if level_i - 1 < len(level_list) else ""
+        if want and _pipe_upper_field(line, 13) != want:
+            return False
+    return True
+
+
+def filter_lines_for_buy_catalog(
+    lines: list[str],
+    bank_i: int,
+    kind_k: int,
+    level_i: int,
+) -> tuple[list[str], list[str], list[str]]:
+    bl, ll = catalog_unique_banks_levels(lines)
+    out = [
+        ln
+        for ln in lines
+        if line_matches_buy_filters(ln, bank_i, kind_k, level_i, bl, ll)
+    ]
+    return out, bl, ll
+
+
+def pack_browse_cb(slug: str, page: int, bank_i: int, kind_k: int, level_i: int) -> str:
+    return f"bpg:{slug}:{page}:{bank_i}:{kind_k}:{level_i}"
+
+
+def unpack_browse_cb(data: str) -> tuple[str, int, int, int, int] | None:
+    if not data.startswith("bpg:"):
+        return None
+    parts = data.split(":")
+
+    def _nint(i: int) -> int:
+        if len(parts) <= i or parts[i] == "":
+            return 0
+        try:
+            return int(parts[i])
+        except ValueError:
+            return 0
+
+    if len(parts) < 3:
+        return None
+    slug = parts[1]
+    try:
+        page = int(parts[2])
+    except ValueError:
+        return None
+    if len(parts) == 3:
+        return slug, page, 0, 0, 0
+    return slug, page, _nint(3), _nint(4), _nint(5)
+
+
+def admin_clear_bin_section(section_bin: str, base: str | None = None) -> bool:
+    load_bin_stock()
+    sections = bin_sections_all()
+    s_raw = str(section_bin).strip()
+    nid = normalize_section_id(s_raw)
+    if nid:
+        if nid in sections:
+            del sections[nid]
+            save_bin_stock()
+            return True
+        return False
+    bk = "".join(c for c in s_raw if c.isdigit())[:6]
+    if len(bk) != 6:
+        return False
+    removed = False
+    for k in list(sections.keys()):
+        if k == bk or k.startswith(f"{bk}:"):
+            del sections[k]
+            removed = True
+    if removed:
+        save_bin_stock()
+    return removed
+
+
+def stock_bins_api_payload() -> dict[str, Any]:
+    load_bin_stock()
+    sections: dict[str, Any] = {}
+    for bk in sorted(BIN_SECTIONS.keys()):
+        sec = BIN_SECTIONS[bk]
+        lines = sec.get("lines") or []
+        sections[bk] = {
+            "price_usd": float(sec.get("price_usd", 0.0)),
+            "lines": len(lines),
+        }
+    return {"sections": sections}
+
+
+@web.middleware
+async def cors_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
+    if request.method == "OPTIONS":
+        return web.Response(status=204, headers=CORS_HEADERS)
+    resp = await handler(request)
+    for hk, hv in CORS_HEADERS.items():
+        resp.headers[hk] = hv
+    return resp
+
+
+async def _leadbot_secret_denied(request: web.Request) -> web.Response | None:
+    if not LEADBOT_API_SECRET:
+        return None
+    got = (request.headers.get("X-Leadbot-Secret") or "").strip()
+    if got != LEADBOT_API_SECRET:
+        return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+    return None
+
+
+async def handle_stock_bins(_request: web.Request) -> web.Response:
+    return web.json_response(stock_bins_api_payload())
+
+
+async def handle_sendout(request: web.Request) -> web.Response:
+    deny = await _leadbot_secret_denied(request)
+    if deny is not None:
+        return deny
+    if not ADMIN_USER_IDS:
+        return web.json_response(
+            {"ok": False, "error": "ADMIN_USER_IDS not set in .env"}, status=503
+        )
+    ptb_app: Application = request.app["ptb_app"]
+    bot = ptb_app.bot
+    load_bin_stock()
+    summary_lines: list[str] = ["📤 <b>Stock sendout</b> <i>(unified BIN catalog)</i>", ""]
+    full_text_parts: list[str] = []
+    total_lines = 0
+    for section_bin in sorted(BIN_SECTIONS.keys()):
+        sec = BIN_SECTIONS[section_bin]
+        lines = list(sec.get("lines") or [])
+        price = float(sec.get("price_usd", 0.0))
+        n_lines = len(lines)
+        total_lines += n_lines
+        summary_lines.append(
+            f"• section <b>{section_bin}</b> · "
+            f"{fmt_usd(price)}/line · {n_lines} line(s)"
+        )
+        full_text_parts.append(
+            f"\n=== section:{section_bin} price:{price} ===\n"
+        )
+        sort_stock_lines(lines)
+        for line in lines:
+            full_text_parts.append(line)
+    if total_lines == 0:
+        return web.json_response(
+            {"ok": False, "error": "No stock — use /stock (admin) to add lines"},
+            status=400,
+        )
+    summary_text = "\n".join(summary_lines)
+    full_body = "\n".join(full_text_parts)
+    use_pre = len(full_body) <= 3500
+    failed = 0
+    for aid in ADMIN_USER_IDS:
+        try:
+            await bot.send_message(chat_id=aid, text=summary_text, parse_mode="HTML")
+            if use_pre:
+                await bot.send_message(
+                    chat_id=aid,
+                    text=f"<pre>{html.escape(full_body)}</pre>",
+                    parse_mode="HTML",
+                )
+            else:
+                doc = io.BytesIO(full_body.encode("utf-8"))
+                doc.name = "sendout_stock.txt"
+                await bot.send_document(
+                    chat_id=aid,
+                    document=doc,
+                    caption="📤 Full sendout dump",
+                )
+            await asyncio.sleep(0.05)
+        except Exception:
+            log.exception("Sendout failed for admin chat_id=%s", aid)
+            failed += 1
+    if failed == len(ADMIN_USER_IDS):
+        return web.json_response(
+            {"ok": False, "error": "Could not deliver to any admin (check bot / chat id)"},
+            status=502,
+        )
+    return web.json_response({"ok": True})
+
+
+_ROOT_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/><title>Leadbot API</title>
+<style>body{font-family:system-ui,sans-serif;max-width:42rem;margin:2rem auto;padding:0 1rem;
+background:#111;color:#e5e5e5;line-height:1.5}code{background:#222;padding:.15rem .4rem;border-radius:4px}
+a{color:#f97316}h1{font-size:1.25rem}.ok{color:#86efac}</style></head><body>
+<h1>Leadbot HTTP API</h1>
+<p class="ok">Server is running.</p>
+<p>Stock is managed in Telegram with <code>/stock</code> (admins). Optional JSON:</p>
+<ul>
+<li><code>GET /api/stock-bins</code> — BIN sections (one catalog) · line counts (JSON)</li>
+<li><code>POST /api/sendout</code> — send stock dump to Telegram admins (<code>X-Leadbot-Secret</code> if set)</li></ul>
+<p><a href="/api/stock-bins">Try stock-bins JSON</a></p>
+</body></html>"""
+
+
+async def handle_root(_request: web.Request) -> web.Response:
+    return web.Response(text=_ROOT_HTML, content_type="text/html", charset="utf-8")
+
+
+def _http_listen_port() -> int:
+    """Public hosts (Railway) inject PORT — must match 'Target port' in Railway networking."""
+    for key in ("PORT", "LEADBOT_HTTP_PORT"):
+        raw = os.getenv(key, "").strip()
+        if raw.isdigit():
+            p = int(raw)
+            log.info("HTTP API will listen on %s (from %s)", p, key)
+            return p
+    if os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID"):
+        log.warning(
+            "PORT not set — Railway routing usually expects 8080; binding 8080 "
+            "(set PORT in Variables to match Public Networking → Target port)"
+        )
+        return 8080
+    log.info("HTTP API will listen on 8787 (local default; set PORT or LEADBOT_HTTP_PORT to override)")
+    return 8787
+
+
+async def start_leadbot_http(ptb_application: Application) -> None:
+    web_app = web.Application(middlewares=[cors_middleware])
+    web_app["ptb_app"] = ptb_application
+    web_app.router.add_get("/", handle_root)
+    web_app.router.add_get("/api/stock-bins", handle_stock_bins)
+    web_app.router.add_post("/api/sendout", handle_sendout)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    port = _http_listen_port()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info(
+        "Leadbot HTTP API on port %s — / + GET /api/stock-bins, POST /api/sendout",
+        port,
+    )
+
+
+def resolve_header_image_path() -> Path | None:
+    """Banner on /start: BOT_HEADER_IMAGE, or assets/*, or repo-root header.* (matches Docker layout)."""
+    env = os.getenv("BOT_HEADER_IMAGE", "").strip()
+    if env:
+        p = Path(env).expanduser()
+        if p.is_file():
+            return p
+        log.warning("BOT_HEADER_IMAGE set but not a file: %s", env)
+    for name in ("header.png", "header.jpg", "header.jpeg", "header.webp"):
+        for base in (ASSETS_DIR, ROOT_DIR):
+            candidate = base / name
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+async def post_init(ptb_application: Application) -> None:
+    global ADMIN_USER_IDS
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+    ADMIN_USER_IDS = _parse_admin_ids()
+    if ADMIN_USER_IDS:
+        log.info("ADMIN_USER_IDS loaded: %s admin account(s)", len(ADMIN_USER_IDS))
+    else:
+        log.warning("ADMIN_USER_IDS is empty — no Telegram admins until you set the variable")
+
+    load_bin_stock()
+    if resolve_header_image_path() is None:
+        log.warning(
+            "No header banner for /start — add assets/header.png or header.png at project root, "
+            "or set BOT_HEADER_IMAGE in env",
+        )
+    try:
+        wi = await ptb_application.bot.get_webhook_info()
+        if wi.url:
+            log.warning(
+                "Telegram webhook was active (%s); removing so getUpdates polling works",
+                wi.url,
+            )
+            await ptb_application.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        log.warning("Could not query/delete Telegram webhook", exc_info=True)
+    await start_leadbot_http(ptb_application)
+
+
+def load_known_users() -> set[int]:
+    if not KNOWN_USERS_PATH.is_file():
+        return set()
+    try:
+        data = json.loads(KNOWN_USERS_PATH.read_text(encoding="utf-8"))
+        return {int(x) for x in data}
+    except (OSError, ValueError, TypeError) as e:
+        log.warning("Could not load %s: %s", KNOWN_USERS_PATH, e)
+        return set()
+
+
+def save_known_users(user_ids: set[int]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    KNOWN_USERS_PATH.write_text(
+        json.dumps(sorted(user_ids), indent=2),
+        encoding="utf-8",
+    )
+
+
+_MAX_ORDERS_PER_USER = 200
+
+
+def load_orders_store() -> dict[str, Any]:
+    if not ORDERS_PATH.is_file():
+        return {}
+    try:
+        raw = json.loads(ORDERS_PATH.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, ValueError, TypeError) as e:
+        log.warning("Could not load %s: %s", ORDERS_PATH, e)
+        return {}
+
+
+def save_orders_store(store: dict[str, Any]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ORDERS_PATH.write_text(
+        json.dumps(store, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def record_purchase_order(
+    user_id: int,
+    wallet: str,
+    section_bin: str,
+    card_bin: str,
+    price_usd: float,
+    line: str,
+) -> None:
+    store = load_orders_store()
+    key = str(int(user_id))
+    lst = store.get(key)
+    if not isinstance(lst, list):
+        lst = []
+    entry: dict[str, Any] = {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "wallet": str(wallet),
+        "section_bin": str(section_bin).strip()[:48],
+        "card_bin": str(card_bin)[:6],
+        "price_usd": float(price_usd),
+        "line": str(line),
+    }
+    lst.append(entry)
+    if len(lst) > _MAX_ORDERS_PER_USER:
+        lst = lst[-_MAX_ORDERS_PER_USER :]
+    store[key] = lst
+    save_orders_store(store)
+
+
+def format_my_orders_html(user_id: int, limit: int = 12) -> str:
+    store = load_orders_store()
+    lst = store.get(str(int(user_id)))
+    if not isinstance(lst, list) or not lst:
+        return (
+            "📦 <b>My orders</b>\n\n"
+            "<i>No purchases yet.</i> Tap <b>Buy Cards</b> to shop."
+        )
+    total = len(lst)
+    recent = list(reversed(lst))[:limit]
+    line_cap = 900
+    parts: list[str] = [
+        f"📦 <b>My orders</b> <i>(newest first · {total} purchase(s))</i>\n",
+    ]
+    for i, o in enumerate(recent, 1):
+        at_raw = str(o.get("at", ""))
+        at_s = at_raw[:19].replace("T", " ") if at_raw else "—"
+        sec = html.escape(str(o.get("section_bin", ""))[:48])
+        cb = html.escape(str(o.get("card_bin", ""))[:6])
+        pr = float(o.get("price_usd", 0.0))
+        raw_line = str(o.get("line", ""))
+        truncated = len(raw_line) > line_cap
+        chunk = raw_line[:line_cap]
+        parts.append(
+            f"\n<b>{i}.</b> {html.escape(at_s)} UTC\n"
+            f"Section <code>{sec}</code> · BIN <code>{cb}</code> · {fmt_usd(pr)}\n"
+            f"<code>{html.escape(chunk)}</code>"
+            + ("…" if truncated else "")
+        )
+    if total > limit:
+        parts.append(f"\n\n<i>Showing last {limit} orders (oldest are trimmed).</i>")
+    return "".join(parts)
+
+
+known_user_ids: set[int] = load_known_users()
+
+# Users who tapped "add TX link" and must send explorer URL next (mirrors context.user_data).
+_awaiting_tx_link_user_ids: set[int] = set()
+
+
+def mark_awaiting_tx_link(user_id: int) -> None:
+    _awaiting_tx_link_user_ids.add(int(user_id))
+
+
+def clear_awaiting_tx_link(user_id: int) -> None:
+    _awaiting_tx_link_user_ids.discard(int(user_id))
+
+
+# Cash App cashtag flow (manual admin approval).
+_awaiting_cashtag_user_ids: set[int] = set()
+
+
+def mark_awaiting_cashtag(user_id: int) -> None:
+    _awaiting_cashtag_user_ids.add(int(user_id))
+
+
+def clear_awaiting_cashtag(user_id: int) -> None:
+    _awaiting_cashtag_user_ids.discard(int(user_id))
+
+
+class _AwaitingTxLinkMessageFilter(filters.MessageFilter):
+    """Only messages from users who tapped “add TX link” (see `_awaiting_tx_link_user_ids`)."""
+
+    def filter(self, message: Message) -> bool:
+        if not message.from_user or not message.text:
+            return False
+        if message.text.strip().startswith("/"):
+            return False
+        return message.from_user.id in _awaiting_tx_link_user_ids
+
+
+AWAITING_TX_LINK_FILTER = (
+    filters.TEXT & filters.ChatType.PRIVATE & _AwaitingTxLinkMessageFilter()
+)
+
+
+# Admin “Add stock” wizard (see `handle_admin_stock_message`).
+_admin_stock_wizard_user_ids: set[int] = set()
+
+
+def mark_admin_stock_wizard(user_id: int) -> None:
+    _admin_stock_wizard_user_ids.add(int(user_id))
+
+
+def clear_admin_stock_wizard(user_id: int) -> None:
+    _admin_stock_wizard_user_ids.discard(int(user_id))
+
+
+class _AdminStockWizardMessageFilter(filters.MessageFilter):
+    """Private text from admins in the add-stock flow (not slash-commands)."""
+
+    def filter(self, message: Message) -> bool:
+        if not message.from_user or not message.text:
+            return False
+        if message.text.strip().startswith("/"):
+            return False
+        uid = message.from_user.id
+        if uid not in _admin_stock_wizard_user_ids:
+            return False
+        return is_admin(uid)
+
+
+ADMIN_STOCK_WIZARD_FILTER = (
+    filters.TEXT
+    & filters.ChatType.PRIVATE
+    & _AdminStockWizardMessageFilter()
+)
+
+
+# Admin tapped “Announcement” — next plain-text message is broadcast to all known users.
+_admin_announce_pending_ids: set[int] = set()
+
+
+def mark_admin_announce_pending(user_id: int) -> None:
+    _admin_announce_pending_ids.add(int(user_id))
+
+
+def clear_admin_announce_pending(user_id: int) -> None:
+    _admin_announce_pending_ids.discard(int(user_id))
+
+
+class _AdminAnnounceMessageFilter(filters.MessageFilter):
+    """Next message after admin chose 📢 Announcement (broadcast to known_user_ids)."""
+
+    def filter(self, message: Message) -> bool:
+        if not message.from_user or not message.text:
+            return False
+        if message.text.strip().startswith("/"):
+            return False
+        uid = message.from_user.id
+        if uid in _admin_stock_wizard_user_ids:
+            return False
+        if uid not in _admin_announce_pending_ids:
+            return False
+        return is_admin(uid)
+
+
+ADMIN_ANNOUNCE_FILTER = (
+    filters.TEXT
+    & filters.ChatType.PRIVATE
+    & _AdminAnnounceMessageFilter()
+)
+
+
+class _AwaitingCashtagMessageFilter(filters.MessageFilter):
+    """After user chose Cash App, next text = their $cashtag for the claim."""
+
+    def filter(self, message: Message) -> bool:
+        if not message.from_user or not message.text:
+            return False
+        if message.text.strip().startswith("/"):
+            return False
+        uid = message.from_user.id
+        if uid in _admin_stock_wizard_user_ids:
+            return False
+        if uid not in _awaiting_cashtag_user_ids:
+            return False
+        return True
+
+
+AWAITING_CASHTAG_FILTER = (
+    filters.TEXT
+    & filters.ChatType.PRIVATE
+    & _AwaitingCashtagMessageFilter()
+)
+
+
+def _default_payment_store() -> dict[str, Any]:
+    return {"next_id": 1, "claims": []}
+
+
+def load_payment_store() -> dict[str, Any]:
+    if not PAYMENTS_PATH.is_file():
+        return _default_payment_store()
+    try:
+        return json.loads(PAYMENTS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as e:
+        log.warning("Could not load payments: %s", e)
+        return _default_payment_store()
+
+
+def save_payment_store(store: dict[str, Any]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    PAYMENTS_PATH.write_text(
+        json.dumps(store, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def add_payment_claim(
+    user: User,
+    amount_usd: float,
+    coin: str,
+    pay_source: str,
+    payment_base: str | None = None,
+    tx_link: str = "",
+) -> dict[str, Any]:
+    store = load_payment_store()
+    cid = int(store["next_id"])
+    store["next_id"] = cid + 1
+    _ = payment_base  # legacy signature
+    claim: dict[str, Any] = {
+        "id": cid,
+        "user_id": user.id,
+        "username": user.username or "",
+        "full_name": user.full_name or "",
+        "amount_usd": float(amount_usd),
+        "coin": coin,
+        "pay_source": pay_source,
+        "base_key": CLAIM_BALANCE_BUCKET,
+        "payment_base": legacy_payment_claim_label(),
+        "tx_link": (tx_link or "").strip(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": "pending",
+        "resolved_at": None,
+        "resolved_by": None,
+    }
+    store["claims"].append(claim)
+    save_payment_store(store)
+    return claim
+
+
+def apply_claim_resolution(
+    claim_id: int,
+    status: str,
+    admin_id: int,
+) -> tuple[bool, str, dict[str, Any] | None]:
+    if status not in ("accepted", "rejected"):
+        return False, "Invalid status", None
+    store = load_payment_store()
+    for c in store["claims"]:
+        if int(c["id"]) != claim_id:
+            continue
+        if c["status"] != "pending":
+            return False, f"Claim #{claim_id} is already {c['status']}.", c
+        c["status"] = status
+        c["resolved_at"] = datetime.now(timezone.utc).isoformat()
+        c["resolved_by"] = admin_id
+        if status == "accepted":
+            bal_user = ensure_user(int(c["user_id"]))
+            amt = float(c["amount_usd"])
+            bal_user["balance"] = float(bal_user.get("balance", 0.0)) + amt
+            bal_user["deposits"] = float(bal_user.get("deposits", 0.0)) + amt
+        save_payment_store(store)
+        return True, "Updated.", c
+    return False, f"Claim #{claim_id} not found.", None
+
+
+def payment_user_stats() -> dict[str, Any]:
+    store = load_payment_store()
+    claimed_users = {int(c["user_id"]) for c in store["claims"]}
+    pending = sum(1 for c in store["claims"] if c["status"] == "pending")
+    accepted = sum(1 for c in store["claims"] if c["status"] == "accepted")
+    rejected = sum(1 for c in store["claims"] if c["status"] == "rejected")
+    total_users = len(known_user_ids)
+    browse_only = len(known_user_ids - claimed_users)
+    return {
+        "total_users": total_users,
+        "users_ever_claimed": len(claimed_users),
+        "users_browse_only": browse_only,
+        "pending": pending,
+        "accepted": accepted,
+        "rejected": rejected,
+        "total_claims": len(store["claims"]),
+    }
+
+
+def list_pending_claims(limit: int = 25) -> list[dict[str, Any]]:
+    store = load_payment_store()
+    pend = [c for c in store["claims"] if c["status"] == "pending"]
+    pend.sort(key=lambda x: int(x["id"]), reverse=True)
+    return pend[:limit]
+
+
+def list_recent_claims(limit: int = 30) -> list[dict[str, Any]]:
+    store = load_payment_store()
+    allc = list(store["claims"])
+    allc.sort(key=lambda x: int(x["id"]), reverse=True)
+    return allc[:limit]
+
+
+def claim_detail_html(claim: dict[str, Any]) -> str:
+    uname = f"@{claim['username']}" if claim.get("username") else "—"
+    extra = ""
+    if claim.get("resolved_at"):
+        extra = f"\nResolved: <code>{html.escape(str(claim['resolved_at']))}</code>"
+    coin_l = str(claim.get("coin", "") or "").lower()
+    ref_lbl = "Cash App cashtag" if coin_l == "cashapp" else "TX link"
+    ref_val = str(claim.get("tx_link") or "—")[:500]
+    return (
+        f"📥 <b>Payment claim</b> #{claim['id']}\n\n"
+        f"User: {html.escape(str(claim.get('full_name') or '—'))} "
+        f"({html.escape(uname)})\n"
+        f"ID: <code>{claim['user_id']}</code>\n"
+        f"Amount: <b>{fmt_usd(float(claim['amount_usd']))}</b> USD\n"
+        f"Coin: <b>{str(claim.get('coin', '')).upper()}</b>\n"
+        f"Adds to: <b>{html.escape(str(claim.get('payment_base') or '—'))}</b>\n"
+        f"{ref_lbl}: {html.escape(ref_val)}\n"
+        f"Flow: <b>{html.escape(str(claim.get('pay_source', '')))}</b>\n"
+        f"Status: <b>{html.escape(str(claim.get('status', '')))}</b>\n"
+        f"Created: <code>{html.escape(str(claim.get('created_at', '')))}</code>"
+        f"{extra}"
+    )
+
+
+def format_claim_oneline(c: dict[str, Any]) -> str:
+    un = f"@{c['username']}" if c.get("username") else "—"
+    return (
+        f"#{c['id']} {html.escape(str(c.get('full_name') or '—'))} ({html.escape(un)}) "
+        f"{fmt_usd(float(c['amount_usd']))} <b>{html.escape(str(c.get('coin', '')).upper())}</b> "
+        f"<i>{html.escape(str(c.get('status', '')))}</i>"
+    )
+
+
+async def notify_admins_new_claim(bot, claim: dict[str, Any]) -> None:
+    if not ADMIN_USER_IDS:
+        return
+    text = claim_detail_html(claim)
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Accept", callback_data=f"adm_acc_{claim['id']}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"adm_rej_{claim['id']}"),
+            ]
+        ]
+    )
+    for aid in ADMIN_USER_IDS:
+        try:
+            await bot.send_message(
+                chat_id=aid,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+            await asyncio.sleep(0.04)
+        except Exception:
+            log.info("Admin notify failed aid=%s", aid, exc_info=True)
+
+
+async def admin_claim_button_action(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    data: str,
+    admin_user: User,
+) -> None:
+    if not is_admin(admin_user.id):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+    if data.startswith("adm_acc_"):
+        status = "accepted"
+        prefix = "adm_acc_"
+    elif data.startswith("adm_rej_"):
+        status = "rejected"
+        prefix = "adm_rej_"
+    else:
+        return
+    try:
+        cid = int(data.removeprefix(prefix))
+    except ValueError:
+        await query.answer("Invalid claim id.", show_alert=True)
+        return
+    ok, msg, claim = apply_claim_resolution(cid, status, admin_user.id)
+    if not ok or not claim:
+        await query.answer(msg[:200], show_alert=True)
+        return
+    await query.answer("Saved.")
+    try:
+        await query.edit_message_text(
+            claim_detail_html(claim),
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+    except Exception:
+        log.warning("Could not edit admin claim message", exc_info=True)
+
+
+def register_known_user(user_id: int) -> None:
+    if user_id not in known_user_ids:
+        known_user_ids.add(user_id)
+        save_known_users(known_user_ids)
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_USER_IDS
+
+
+def ensure_user(user_id: int) -> dict[str, Any]:
+    register_known_user(user_id)
+    if user_id not in USERS:
+        USERS[user_id] = {
+            "balance": 0.0,
+            "deposits": 0.0,
+            "spent": 0.0,
+            "status": "active",
+        }
+    u = USERS[user_id]
+    extra = 0.0
+    extra += float(u.pop("jr_bucks", 0.0))
+    extra += float(u.pop("tony_bucks", 0.0))
+    for key in list(u.keys()):
+        if isinstance(key, str) and key.endswith("_credits"):
+            extra += float(u.pop(key, 0.0))
+    if extra:
+        u["balance"] = float(u.get("balance", 0.0)) + extra
+    u.setdefault("balance", 0.0)
+    return u
+
+
+def shop_credit_display_for_payment(_base_k: str | None = None) -> str:
+    return "balance"
+
+
+def user_shop_balance(u: dict[str, Any]) -> float:
+    return float(u.get("balance", 0.0))
+
+
+def fmt_usd(n: float) -> str:
+    return f"${n:,.2f}"
+
+
+def format_start_caption(user_id: int) -> str:
+    u = ensure_user(user_id)
+    total = user_shop_balance(u)
+    if total == int(total):
+        credits_s = str(int(total))
+    else:
+        credits_s = f"{total:.2f}"
+    return (
+        "Welcome to <b>Goatys</b> — grand release 🐐\n\n"
+        f"<b>Balance:</b> {credits_s}\n\n"
+        f"{CAPTION}"
+    )
+
+
+def main_reply_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    """Persistent bottom menu (ReplyKeyboard) — Goatys layout."""
+    u = ensure_user(user_id)
+    total = user_shop_balance(u)
+    if total == int(total):
+        cred = str(int(total))
+    else:
+        cred = f"{total:.2f}"
+    rows: list[list[KeyboardButton]] = [
+        [
+            KeyboardButton(BTN_REPLY_TOPUP),
+            KeyboardButton(BTN_REPLY_BUY),
+        ],
+        [
+            KeyboardButton(BTN_REPLY_ORDERS),
+            KeyboardButton(f"Balance: {cred}"),
+        ],
+        [
+            KeyboardButton(BTN_REPLY_CHANNEL),
+            KeyboardButton(BTN_REPLY_SUPPORT),
+        ],
+    ]
+    if is_admin(user_id):
+        rows.append([KeyboardButton(BTN_REPLY_ADMIN)])
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Menu below…",
+    )
+
+
+class _MainReplyMenuTextFilter(filters.MessageFilter):
+    """Exact labels from main_reply_keyboard (Balance row matches prefix)."""
+
+    def filter(self, message: Message) -> bool:
+        if not message.text:
+            return False
+        t = message.text.strip()
+        if t.startswith("/"):
+            return False
+        if t in (
+            BTN_REPLY_TOPUP,
+            BTN_REPLY_BUY,
+            BTN_REPLY_ORDERS,
+            BTN_REPLY_CHANNEL,
+            BTN_REPLY_SUPPORT,
+            BTN_REPLY_ADMIN,
+        ):
+            return True
+        if t.startswith("Balance:"):
+            return True
+        return False
+
+
+REPLY_MAIN_MENU_FILTER = (
+    filters.TEXT
+    & filters.ChatType.PRIVATE
+    & ~filters.COMMAND
+    & _MainReplyMenuTextFilter()
+)
+
+
+def admin_portal_menu_html() -> str:
+    st = payment_user_stats()
+    return (
+        "🔐 <b>Admin portal</b>\n\n"
+        f"Users who used the bot: <b>{len(known_user_ids)}</b>\n"
+        f"⏳ Pending payment claims: <b>{st['pending']}</b>\n\n"
+        "<b>Upload cards</b> adds lines to one shared BIN catalog "
+        "(each line sells once — <b>/stock</b> wizard)."
+    )
+
+
+def admin_portal_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💳 Payments", callback_data="adm_port_pay")],
+            [
+                InlineKeyboardButton(
+                    "📤 Upload cards (stock)",
+                    callback_data="adm_port_upload",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🗄️ Stock overview (BINs)",
+                    callback_data="adm_port_bin",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📢 Announcement (all users)",
+                    callback_data="adm_port_ann",
+                )
+            ],
+            [InlineKeyboardButton("⬅️ Home", callback_data="adm_port_home")],
+        ]
+    )
+
+
+def admin_subnav_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ Admin menu", callback_data="adm_port_menu")]]
+    )
+
+
+def payment_portal_html() -> str:
+    s = payment_user_stats()
+    return (
+        "💳 <b>Payments</b>\n\n"
+        f"👥 Users who opened the bot: <b>{s['total_users']}</b>\n"
+        f"🧾 Users who submitted “payment sent” (any time): <b>{s['users_ever_claimed']}</b>\n"
+        f"👀 Browsing only (never filed a claim): <b>{s['users_browse_only']}</b>\n\n"
+        f"Claims — ⏳ <b>{s['pending']}</b> pending · "
+        f"✅ <b>{s['accepted']}</b> accepted · "
+        f"❌ <b>{s['rejected']}</b> rejected\n"
+        f"Total rows: <b>{s['total_claims']}</b>\n\n"
+        "<b>/pendingclaims</b> — pending queue\n"
+        "<b>/allclaims</b> — recent claims (all statuses)\n"
+        "<b>/accept 12</b> / <b>/reject 12</b> — by claim #"
+    )
+
+
+def admin_bin_notebook_html() -> str:
+    load_bin_stock()
+    lines_out: list[str] = [
+        "🗄️ <b>BIN notebook</b> <i>(unified stock)</i>\n",
+    ]
+    if not BIN_SECTIONS:
+        lines_out.append("\n<i>No BIN sections loaded.</i>")
+    else:
+        for bk in sorted(BIN_SECTIONS.keys()):
+            sec = BIN_SECTIONS[bk]
+            n = len(sec.get("lines") or [])
+            price = float(sec.get("price_usd", 0.0))
+            lines_out.append(
+                f"\n· <code>{html.escape(bk)}</code> — {fmt_usd(price)}/line · "
+                f"<b>{n}</b> line(s)"
+            )
+    lines_out.append(
+        "\n<i>Add stock below or use</i> <code>/stock</code> <i>(quick line).</i>"
+    )
+    return "".join(lines_out)
+
+def admin_bin_notebook_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📦 Add stock", callback_data="adm_stock")],
+            [InlineKeyboardButton("⬅️ Admin menu", callback_data="adm_port_menu")],
+        ]
+    )
+
+
+BUY_CATALOG_PAGE_SIZE = 8
+BIN_BTN_TEXT_MAX = 128
+
+
+def section_catalog_html_title(section_id: str) -> str:
+    load_bin_stock()
+    sid = slug_to_section_id(section_id.strip()) or normalize_section_id(section_id.strip()) or section_id.strip()
+    sec = bin_sections_all().get(sid) or {}
+    price = float(sec.get("price_usd", 0.0))
+    return f"{section_title_html(sid)} · {fmt_usd(price)}"
+
+
+def buy_menu_keyboard() -> InlineKeyboardMarkup:
+    """One row per BIN × pile section."""
+    load_bin_stock()
+    rows: list[list[InlineKeyboardButton]] = []
+    sections = bin_sections_all()
+    for sid in sorted(sections.keys(), key=section_sort_key):
+        sec = sections[sid]
+        n = len(sec.get("lines") or [])
+        price = float(sec.get("price_usd", 0.0))
+        slug = section_id_to_slug(sid)
+        bin6 = sid.split(":")[0] if ":" in sid else sid[:6]
+        pile_l = (sid.split(":")[1] if ":" in sid else PILE_LIVE).upper()
+        cap = f"{bin6} · {pile_l} · {fmt_usd(price)}"
+        if len(cap) > BIN_BTN_TEXT_MAX:
+            cap = cap[: BIN_BTN_TEXT_MAX - 1] + "…"
+        suf = cap + (f" · {n}" if n else " · ∅")
+        if len(suf) > BIN_BTN_TEXT_MAX:
+            suf = suf[: BIN_BTN_TEXT_MAX - 1] + "…"
+        if n <= 0:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"{cap} · Out of stock",
+                        callback_data=f"oos:{slug}",
+                    )
+                ]
+            )
+        else:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        suf,
+                        callback_data=f"open_sec:{slug}",
+                    )
+                ]
+            )
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="buy_back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def extract_city_state_from_line(line: str) -> tuple[str, str]:
+    """Pipe format: card|mm|yy|cvv|name|address|city|state|... (matches HTML sorter)."""
+    parts = line.split("|")
+    if len(parts) < 8:
+        return "?", "?"
+    city = (parts[6] or "").strip().strip('"').strip()
+    state = (parts[7] or "").strip().strip('"').strip().upper()
+    if not city:
+        city = "?"
+    if not state:
+        state = "?"
+    elif len(state) > 3:
+        state = state[:2].upper()
+    else:
+        state = state.upper()
+    return city[:20], state[:2]
+
+
+def primary_location_label(lines: list[str]) -> str:
+    """Most common city, ST, ZIP from stock lines (matches chip preview)."""
+    freq: dict[str, int] = {}
+    for line in lines:
+        parts = line.split("|")
+        city, st = extract_city_state_from_line(line)
+        z = (
+            (parts[8] if len(parts) > 8 else "").strip().strip('"')
+            if len(parts) > 8
+            else ""
+        )
+        if city == "?" or st in ("", "?"):
+            continue
+        key = f"{city}, {st}"
+        if z:
+            key = f"{city}, {st} {z}"
+        freq[key] = freq.get(key, 0) + 1
+    if not freq:
+        return ""
+    return max(freq.items(), key=lambda x: (x[1], x[0]))[0]
+
+
+def format_bin_row_button_text(
+    bin_key: str, line_count: int, price: float, location: str
+) -> str:
+    price_s = fmt_usd(price)
+    core = f"{bin_key} ×{line_count} · {price_s}"
+    if not location:
+        return core[:BIN_BTN_TEXT_MAX]
+    extra = f" · {location}"
+    if len(core + extra) <= BIN_BTN_TEXT_MAX:
+        return core + extra
+    room = BIN_BTN_TEXT_MAX - len(core) - 3
+    if room < 4:
+        return core[:BIN_BTN_TEXT_MAX]
+    loc_short = location[:room] + ("…" if len(location) > room else "")
+    return core + " · " + loc_short
+
+
+def _bank_filter_caption(bi: int, bl: list[str]) -> str:
+    if bi <= 0:
+        return "All banks"
+    if bi - 1 < len(bl):
+        return bl[bi - 1][:28]
+    return "Bank?"
+
+
+def _level_filter_caption(li: int, ll: list[str]) -> str:
+    if li <= 0:
+        return "All levels"
+    if li - 1 < len(ll):
+        return ll[li - 1][:28]
+    return "Level?"
+
+
+def _kind_filter_label(kind_k: int) -> str:
+    for lbl, kk in FILTER_KIND_LABELS:
+        if kk == kind_k:
+            return lbl
+    return "—"
+
+
+def section_catalog_text_and_keyboard(
+    section_id: str,
+    user_id: int,
+    page: int = 0,
+    bank_i: int = 0,
+    kind_k: int = FILTER_KIND_ALL,
+    level_i: int = 0,
+) -> tuple[str, InlineKeyboardMarkup]:
+    load_bin_stock()
+    u = ensure_user(user_id)
+    sid = slug_to_section_id(section_id.strip()) or normalize_section_id(
+        section_id.strip()
+    ) or section_id.strip()
+    slug = section_id_to_slug(sid)
+
+    sec = bin_sections_all().get(sid)
+    head = section_catalog_html_title(sid)
+    bal = user_shop_balance(u)
+    if not sec:
+        text = f"💳 <b>{head}</b>\n\n<b>Section missing.</b>"
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Back", callback_data="buy_tier_back")]]
+        )
+        return text, kb
+
+    price = float(sec.get("price_usd", 0.0))
+    raw_lines = list(sec.get("lines") or [])
+    filtered, bank_list, level_list = filter_lines_for_buy_catalog(
+        raw_lines, bank_i, kind_k, level_i
+    )
+
+    tier_stock = group_lines_by_card_bin(filtered)
+    bins_sorted = sorted(
+        tier_stock.keys(),
+        key=lambda bk: bin_bucket_catalog_sort_key(tier_stock[bk]),
+    )
+    total_bins = len(bins_sorted)
+    total_lines = len(filtered)
+    total_raw = len(raw_lines)
+
+    if total_bins == 0:
+        text = (
+            f"💳 <b>{head}</b>\n"
+            f"Price: <b>{fmt_usd(price)}</b> per line · "
+            f"<b>Balance:</b> {fmt_usd(bal)}\n\n"
+            "<i>Filters hid every line.</i> Loosen issuer / type / level, or ask an "
+            "admin to restock.\n\n"
+            f"<b>Listed lines (after filters):</b> <b>{total_lines}</b> / {total_raw} raw"
+        )
+        kb_rows: list[list[InlineKeyboardButton]] = _catalog_filter_keyboard_rows(
+            slug, 0, bank_i, kind_k, level_i, bank_list, level_list, False
+        )
+        kb_rows.append(
+            [InlineKeyboardButton("⬅️ Back", callback_data="buy_tier_back")]
+        )
+        return text, InlineKeyboardMarkup(kb_rows)
+
+    bank_cap = html.escape(_bank_filter_caption(bank_i, bank_list))
+    lvl_cap = html.escape(_level_filter_caption(level_i, level_list))
+    kind_cap = html.escape(_kind_filter_label(kind_k))
+
+    start = page * BUY_CATALOG_PAGE_SIZE
+    chunk = bins_sorted[start : start + BUY_CATALOG_PAGE_SIZE]
+    more_note = ""
+    if total_bins > BUY_CATALOG_PAGE_SIZE:
+        more_note = (
+            f"\n<i>Showing {start + 1}–{start + len(chunk)} of {total_bins} BIN buckets</i>"
+        )
+
+    notes = str(sec.get("listing_notes") or "").strip()
+    notes_block = ""
+    if notes:
+        notes_block = (
+            f"\n<b>Listing info</b>\n{html.escape(notes[:1200])}"
+            + ("…" if len(notes) > 1200 else "")
+            + "\n"
+        )
+
+    text = (
+        f"💳 <b>{head}</b>\n"
+        f"Price: <b>{fmt_usd(price)}</b> per line · "
+        f"<b>Lines matching filters:</b> {total_lines} <i>({total_raw} total)</i>\n"
+        f"<b>Balance:</b> {fmt_usd(bal)}\n"
+        "<b>Filters</b> — "
+        f"Bank: <b>{bank_cap}</b> · "
+        f"Type: <b>{kind_cap}</b> · "
+        f"Level slot: <b>{lvl_cap}</b>\n"
+        f"{notes_block}\n"
+        "Tap a <b>BIN bucket</b> to buy <b>one line</b> that matches filters."
+        f"{more_note}"
+    )
+
+    rows: list[list[InlineKeyboardButton]] = _catalog_filter_keyboard_rows(
+        slug, page, bank_i, kind_k, level_i, bank_list, level_list, True
+    )
+
+    for bk in chunk:
+        cnt = len(tier_stock[bk])
+        loc = primary_location_label(tier_stock[bk])
+        btn_text = format_bin_row_button_text(bk, cnt, price, loc)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    btn_text,
+                    callback_data=f"bpr:{slug}:{bk}:{bank_i}:{kind_k}:{level_i}",
+                )
+            ]
+        )
+
+    nav_row: list[InlineKeyboardButton] = []
+    prev_cb = (
+        pack_browse_cb(slug, page - 1, bank_i, kind_k, level_i)
+        if page > 0
+        else None
+    )
+    next_cb = (
+        pack_browse_cb(slug, page + 1, bank_i, kind_k, level_i)
+        if start + BUY_CATALOG_PAGE_SIZE < total_bins
+        else None
+    )
+    if prev_cb:
+        nav_row.append(InlineKeyboardButton("« Prev", callback_data=prev_cb))
+    if next_cb:
+        nav_row.append(InlineKeyboardButton("Next »", callback_data=next_cb))
+    if nav_row:
+        rows.append(nav_row)
+
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="buy_tier_back")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _catalog_filter_keyboard_rows(
+    slug: str,
+    page: int,
+    bank_i: int,
+    kind_k: int,
+    level_i: int,
+    bank_list: list[str],
+    level_list: list[str],
+    include_kind_pick: bool,
+) -> list[list[InlineKeyboardButton]]:
+    out: list[list[InlineKeyboardButton]] = []
+
+    if include_kind_pick:
+        kr: list[InlineKeyboardButton] = []
+        for lbl, kk in FILTER_KIND_LABELS:
+            short = lbl if len(lbl) <= 10 else lbl[:9] + "…"
+            kr.append(
+                InlineKeyboardButton(
+                    short,
+                    callback_data=f"skf|{slug}|{page}|{bank_i}|{kk}|{level_i}",
+                )
+            )
+        for i in range(0, len(kr), 3):
+            out.append(kr[i : i + 3])
+
+    out.append(
+        [
+            InlineKeyboardButton(
+                f"🏦 {_bank_filter_caption(bank_i, bank_list)} ›",
+                callback_data=f"cbf|{slug}|{page}|{bank_i}|{kind_k}|{level_i}",
+            ),
+            InlineKeyboardButton(
+                f"📊 {_level_filter_caption(level_i, level_list)} ›",
+                callback_data=f"clf|{slug}|{page}|{bank_i}|{kind_k}|{level_i}",
+            ),
+        ]
+    )
+    return out
+
+
+async def handle_buy_product(
+    query, user: User, data: str, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    parts = data.split(":")
+    if len(parts) != 6 or parts[0] != "bpr":
+        await query.answer("Invalid selection.", show_alert=True)
+        return
+    _, slug, bucket_key = parts[0], parts[1], parts[2].strip()
+    try:
+        bank_i = int(parts[3])
+        kind_k = int(parts[4])
+        level_i = int(parts[5])
+    except ValueError:
+        await query.answer("Invalid selection.", show_alert=True)
+        return
+
+    sid = slug_to_section_id(slug.strip())
+    if not sid:
+        await query.answer("Section not found.", show_alert=True)
+        return
+
+    load_bin_stock()
+    sec = bin_sections_all().get(sid)
+    if not sec:
+        await query.answer("Section not found.", show_alert=True)
+        return
+
+    price = float(sec.get("price_usd", 0.0))
+    raw_lines = list(sec.get("lines") or [])
+    _, bank_list, level_list = filter_lines_for_buy_catalog(
+        raw_lines, bank_i, kind_k, level_i
+    )
+
+    lines_flat = list(sec.get("lines") or [])
+    pick_idx: int | None = None
+    for i, ln in enumerate(lines_flat):
+        if (extract_bin_prefix_from_line(ln) or "") != bucket_key:
+            continue
+        if not line_matches_buy_filters(ln, bank_i, kind_k, level_i, bank_list, level_list):
+            continue
+        pick_idx = i
+        break
+
+    if pick_idx is None:
+        await query.answer(
+            "This BIN group is empty, sold out, or no longer matches your filters.",
+            show_alert=True,
+        )
+        return
+
+    u = ensure_user(user.id)
+    have = user_shop_balance(u)
+    if have < price:
+        await query.answer(
+            "Insufficient balance.\n"
+            f"You have {fmt_usd(have)}.\n"
+            f"This line costs {fmt_usd(price)}.\n"
+            "Top up via 💳 Top-up Balance.",
+            show_alert=True,
+        )
+        return
+
+    line = lines_flat.pop(pick_idx)
+    sections_map = bin_sections_all()
+    if not lines_flat:
+        del sections_map[sid]
+    else:
+        sec["lines"] = lines_flat
+    save_bin_stock()
+    try:
+        record_purchase_order(user.id, "shop", sid, bucket_key, price, line)
+    except Exception:
+        log.warning("Could not record order for user_id=%s", user.id, exc_info=True)
+    u["balance"] = float(u.get("balance", 0.0)) - price
+    u["spent"] = float(u.get("spent", 0.0)) + price
+    await query.answer("Purchased! Delivered below.", show_alert=False)
+    escaped = html.escape(line)
+    await query.message.reply_text(
+        "✅ <b>Delivered</b> · "
+        f"{section_catalog_html_title(sid)}\n"
+        f"BIN <code>{html.escape(bucket_key)}</code> · paid {fmt_usd(price)}\n\n"
+        f"<code>{escaped}</code>",
+        parse_mode="HTML",
+    )
+
+
+async def handle_buy_catalog_page(
+    query, user: User, data: str, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    up = unpack_browse_cb(data)
+    if up is None:
+        await query.answer("Invalid.", show_alert=True)
+        return
+    slug, page, bank_i, kind_k, level_i = up
+    if page < 0:
+        await query.answer("Invalid page.", show_alert=True)
+        return
+    load_bin_stock()
+    sid = slug_to_section_id(slug)
+    if not sid or sid not in bin_sections_all():
+        await query.answer("Invalid.", show_alert=True)
+        return
+    text, kb = section_catalog_text_and_keyboard(
+        slug, user.id, page=page, bank_i=bank_i, kind_k=kind_k, level_i=level_i
+    )
+    await edit_safe(query, text, kb)
+    await query.answer()
+
+
+def topup_amount_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("$10", callback_data="tu_10"),
+                InlineKeyboardButton("$100", callback_data="tu_100"),
+                InlineKeyboardButton("$200", callback_data="tu_200"),
+            ],
+            [
+                InlineKeyboardButton("$500", callback_data="tu_500"),
+                InlineKeyboardButton("$1,000", callback_data="tu_1000"),
+                InlineKeyboardButton("Custom", callback_data="tu_custom"),
+            ],
+            [InlineKeyboardButton("⬅️ Back", callback_data="tu_back")],
+        ]
+    )
+
+
+def pay_method_keyboard() -> InlineKeyboardMarkup:
+    """BTC / LTC / Cash App — one payout flow."""
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton("₿ BTC", callback_data="pay_btc"),
+            InlineKeyboardButton("Ł LTC", callback_data="pay_ltc"),
+        ],
+        [
+            InlineKeyboardButton(
+                "💵 Cash App",
+                callback_data="pay_cashapp",
+            )
+        ],
+        [InlineKeyboardButton("⬅️ Back", callback_data="pay_m_back")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+def coin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📥 I paid — add TX link",
+                    callback_data="pay_tx_step",
+                )
+            ],
+            [InlineKeyboardButton("⬅️ Back", callback_data="pay_coin_back")],
+        ]
+    )
+
+
+TOPUP_TEXT = """💰 <b>Top-up Balance</b>
+
+Choose an amount to add (minimum <b>$10</b>).
+
+Pay with <b>BTC</b>, <b>LTC</b>, or <b>Cash App</b>.
+After admins approve your claim, your <b>balance</b> updates — one wallet for buys and deposits."""
+
+def profile_html(user: User) -> str:
+    u = ensure_user(user.id)
+    name = html.escape(user.full_name or "—")
+    uname = user.username or "—"
+    if uname != "—":
+        uname_h = f'<a href="https://t.me/{html.escape(user.username or "")}">@{html.escape(user.username or "")}</a>'
+    else:
+        uname_h = "—"
+    bal = user_shop_balance(u)
+    return (
+        "👤 <b>Profile</b>\n\n"
+        f"Name: <b>{name}</b>\n"
+        f"Username: {uname_h}\n"
+        f"Telegram ID: <code>{user.id}</code>\n\n"
+        f"<b>Balance:</b> {fmt_usd(bal)}\n\n"
+        f"Total Deposits: <b>{fmt_usd(u['deposits'])}</b>\n"
+        f"Total Spent: <b>{fmt_usd(u['spent'])}</b>\n\n"
+        f"Status: <b>{html.escape(str(u['status']))}</b>"
+    )
+
+
+async def handle_main_reply_menu(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Routes persistent reply-keyboard taps (bottom menu). Group 1 — runs after payment wizards."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user or not msg.text:
+        return
+    uid = user.id
+    text = msg.text.strip()
+    # Leave payment / admin flows if user uses main menu
+    if uid in _awaiting_cashtag_user_ids:
+        clear_awaiting_cashtag(uid)
+        context.user_data.pop("pay_coin", None)
+    if uid in _awaiting_tx_link_user_ids:
+        clear_awaiting_tx_link(uid)
+        context.user_data.pop("awaiting_tx_link", None)
+        context.user_data.pop("pending_tx_link", None)
+    if uid in _admin_stock_wizard_user_ids and is_admin(uid):
+        if context.user_data.get("admin_stock_step") != "buffer":
+            clear_admin_stock_flow(context, uid)
+    if uid in _admin_announce_pending_ids and is_admin(uid):
+        clear_admin_announce_pending(uid)
+
+    if text == BTN_REPLY_TOPUP:
+        await msg.reply_text(
+            TOPUP_TEXT,
+            reply_markup=topup_amount_keyboard(),
+            parse_mode="HTML",
+        )
+        raise ApplicationHandlerStop
+    if text == BTN_REPLY_BUY:
+        await msg.reply_text(
+            "💳 <b>Buy cards</b>\n\n"
+            "Each listing is <b>BIN × pile</b> (<i>live</i> or <i>unchecked</i>). "
+            "Open one, then tighten <b>bank / credit–debit / level</b> before you tap a BIN bucket.",
+            reply_markup=buy_menu_keyboard(),
+            parse_mode="HTML",
+        )
+        raise ApplicationHandlerStop
+
+    if text == BTN_REPLY_ORDERS:
+        await msg.reply_text(
+            format_my_orders_html(uid),
+            reply_markup=main_reply_keyboard(uid),
+            parse_mode="HTML",
+        )
+        raise ApplicationHandlerStop
+    if text.startswith("Balance:"):
+        u = ensure_user(uid)
+        tot = user_shop_balance(u)
+        await msg.reply_text(
+            "💰 <b>Your balance</b>\n\n"
+            f"<b>Balance:</b> {fmt_usd(tot)}\n\n"
+            f"Deposits: <b>{fmt_usd(u['deposits'])}</b> · "
+            f"Spent: <b>{fmt_usd(u['spent'])}</b>",
+            reply_markup=main_reply_keyboard(uid),
+            parse_mode="HTML",
+        )
+        raise ApplicationHandlerStop
+
+    if text == BTN_REPLY_CHANNEL:
+        await msg.reply_text(
+            "📣 <b>Goatys chats</b>\n\n"
+            f"<a href=\"{html.escape(GOATYS_CHANNEL_URL)}\">Tap to join the Goatys chat list</a>",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Open Goatys chats", url=GOATYS_CHANNEL_URL)]]
+            ),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        raise ApplicationHandlerStop
+    if text == BTN_REPLY_SUPPORT:
+        await msg.reply_text(
+            "💬 <b>Support</b>\n\n"
+            f"Message <b>@Blackjack_Swipes</b> · "
+            f"<a href=\"{html.escape(SUPPORT_TELEGRAM_URL)}\">open in Telegram</a>",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Open @Blackjack_Swipes", url=SUPPORT_TELEGRAM_URL)]]
+            ),
+            parse_mode="HTML",
+        )
+        raise ApplicationHandlerStop
+    if text == BTN_REPLY_ADMIN:
+        if not is_admin(uid):
+            await msg.reply_text("⛔ Not authorized.")
+            raise ApplicationHandlerStop
+        await msg.reply_text(
+            admin_portal_menu_html(),
+            parse_mode="HTML",
+            reply_markup=admin_portal_keyboard(),
+        )
+        raise ApplicationHandlerStop
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    uid = update.effective_user.id
+    ensure_user(uid)
+    markup = main_reply_keyboard(uid)
+    caption = format_start_caption(uid)
+    photo_path = resolve_header_image_path()
+    if photo_path is not None:
+        with photo_path.open("rb") as f:
+            await update.message.reply_photo(
+                photo=f,
+                caption=caption,
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+    else:
+        await update.message.reply_text(
+            caption,
+            reply_markup=markup,
+            parse_mode="HTML",
+        )
+
+
+def pay_method_text(amount: float) -> str:
+    return (
+        "💰 <b>SELECT PAYMENT METHOD</b>\n\n"
+        f"Invoice Amount: <b>{fmt_usd(amount)} USD</b>\n\n"
+        "• <b>BTC</b> / <b>LTC</b> — on-chain, then submit your explorer link.\n"
+        "• <b>Cash App</b> — pay off-bot, then send your <b>$cashtag</b>; "
+        "an admin verifies manually.\n\n"
+        "Choose:"
+    )
+
+
+def cashapp_prompt_html(amount: float) -> str:
+    return (
+        "💵 <b>Cash App</b>\n\n"
+        f"Invoice: <b>{fmt_usd(amount)} USD</b>\n\n"
+        "After you pay in Cash App, send <b>one message</b> with your "
+        "<b>Cash App $cashtag</b> only (example: <code>$YourTag</code>).\n\n"
+        "An admin will verify and add funds to your <b>balance</b>.\n"
+        "Typical approval time: <b>3–10 minutes</b> (EST)."
+    )
+
+def cashtag_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Cancel", callback_data="pay_cashapp_cancel")]]
+    )
+
+
+def coin_invoice_text(
+    coin: str, amount: float, address: str, base_label: str = ""
+) -> str:
+    _ = base_label  # unused; kept for call-site compat
+    labels = {
+        "btc": ("₿", "Bitcoin (BTC)"),
+        "ltc": ("Ł", "Litecoin (LTC)"),
+    }
+    sym, title = labels[coin]
+    addr = html.escape(address)
+    return (
+        f"{sym} <b>{title}</b>\n\n"
+        f"Invoice: <b>{fmt_usd(amount)} USD</b>\n\n"
+        "Send crypto to:\n"
+        f"<code>{addr}</code>\n\n"
+        "After you send, tap <b>I paid — add TX link</b>, paste your explorer link, "
+        "then use <b>Final submit</b>. Admins review and credit your <b>balance</b>."
+    )
+
+
+async def delete_message_safe(msg) -> None:
+    try:
+        await msg.delete()
+    except Exception:
+        log.warning("Could not delete message", exc_info=True)
+
+
+async def edit_safe(query, text: str, reply_markup: InlineKeyboardMarkup) -> None:
+    try:
+        await query.edit_message_text(
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        log.warning("Could not edit message", exc_info=True)
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if not query or not query.message or not user:
+        return
+    data = query.data or ""
+
+    if data.startswith("adm_acc_") or data.startswith("adm_rej_"):
+        await admin_claim_button_action(query, context, data, user)
+        return
+
+    if data == "adm_stock":
+        if not is_admin(user.id):
+            await query.answer("Not authorized.", show_alert=True)
+            return
+        await query.answer()
+        clear_admin_announce_pending(user.id)
+        clear_admin_stock_flow(context, user.id)
+        mark_admin_stock_wizard(user.id)
+        context.user_data["admin_stock_step"] = "bin"
+        await query.message.reply_text(
+            admin_stock_wizard_step1_intro(),
+            parse_mode="HTML",
+            reply_markup=admin_stock_reply_keyboard(),
+        )
+        return
+
+    if data.startswith("adm_stock_pick:"):
+        if not is_admin(user.id):
+            await query.answer("Not authorized.", show_alert=True)
+            return
+        await query.answer("Use /stock — BIN is step 1 now.", show_alert=False)
+        return
+
+    if data.startswith("adm_stkpile:"):
+        if not is_admin(user.id):
+            await query.answer("Not authorized.", show_alert=True)
+            return
+        pile = data.split(":", 1)[1].strip().lower()
+        if pile not in VALID_PILES:
+            await query.answer("Invalid pile.", show_alert=True)
+            return
+        if context.user_data.get("admin_stock_step") != "pile":
+            await query.answer(
+                "Send BIN digits first (/stock wizard).",
+                show_alert=True,
+            )
+            return
+        await query.answer()
+        context.user_data["stock_flow_pile"] = pile
+        context.user_data["admin_stock_step"] = "price"
+        await query.message.reply_text(
+            f"Pile: <b>{html.escape(pile.upper())}</b>\n\n"
+            "📦 <b>Step 3</b> — Price per line\n\n"
+            "Send a number, e.g. <code>2.25</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if data == "adm_stock_cancel":
+        if not is_admin(user.id):
+            await query.answer("Not authorized.", show_alert=True)
+            return
+        clear_admin_stock_flow(context, user.id)
+        await query.answer("Wizard cancelled.")
+        await query.message.reply_text("Stock wizard cancelled.")
+        return
+
+    if data == "m_admin":
+        if not is_admin(user.id):
+            await query.answer("Not authorized.", show_alert=True)
+            return
+        await query.answer()
+        await query.message.reply_text(
+            admin_portal_menu_html(),
+            parse_mode="HTML",
+            reply_markup=admin_portal_keyboard(),
+        )
+        return
+
+    if data == "adm_port_menu":
+        if not is_admin(user.id):
+            await query.answer("Not authorized.", show_alert=True)
+            return
+        await query.answer()
+        await query.message.reply_text(
+            admin_portal_menu_html(),
+            parse_mode="HTML",
+            reply_markup=admin_portal_keyboard(),
+        )
+        return
+
+    if data == "adm_port_pay":
+        if not is_admin(user.id):
+            await query.answer("Not authorized.", show_alert=True)
+            return
+        await query.answer()
+        await query.message.reply_text(
+            payment_portal_html(),
+            parse_mode="HTML",
+            reply_markup=admin_subnav_keyboard(),
+        )
+        return
+
+    if data == "adm_port_upload":
+        if not is_admin(user.id):
+            await query.answer("Not authorized.", show_alert=True)
+            return
+        await query.answer()
+        await query.message.reply_text(
+            "📤 <b>Upload cards</b>\n\n"
+            "Tap <b>📦 Add stock</b> for the wizard: "
+            "<b>BIN → Live / Unchecked pile → price → banner tag → paste lines → "
+            "</b><code>/done</code> <b>(commit)</b>.\n\n"
+            "Telegram sometimes splits huge pastes — send every chunk in order. "
+            "Nothing publishes until <code>/done</code>. "
+            "<code>/cancelstock</code> / <code>/cancel</code> exits.\n\n"
+            "<i>Quick one-liner (live pile):</i> "
+            "<code>/stock bin BIN $price PAN MM/YY CVV</code>.",
+            parse_mode="HTML",
+            reply_markup=admin_stock_reply_keyboard(),
+        )
+        return
+
+    if data == "adm_port_bin":
+        if not is_admin(user.id):
+            await query.answer("Not authorized.", show_alert=True)
+            return
+        await query.answer()
+        await query.message.reply_text(
+            admin_bin_notebook_html(),
+            parse_mode="HTML",
+            reply_markup=admin_bin_notebook_keyboard(),
+        )
+        return
+
+    if data == "adm_port_ann":
+        if not is_admin(user.id):
+            await query.answer("Not authorized.", show_alert=True)
+            return
+        if not ADMIN_USER_IDS:
+            await query.answer("Set ADMIN_USER_IDS first.", show_alert=True)
+            return
+        if user.id in _admin_stock_wizard_user_ids:
+            await query.answer(
+                "Finish or cancel the stock wizard (/cancel) first.",
+                show_alert=True,
+            )
+            return
+        await query.answer()
+        mark_admin_announce_pending(user.id)
+        await query.message.reply_text(
+            "📢 <b>Announcement</b>\n\n"
+            "Send your <b>next message</b> as plain text — it will be delivered to "
+            f"<b>all {len(known_user_ids)}</b> users who have used the bot "
+            "(same list as <code>/announce</code>).\n\n"
+            "<code>/cancel</code> to abort.",
+            parse_mode="HTML",
+            reply_markup=admin_subnav_keyboard(),
+        )
+        return
+
+    if data == "adm_port_home":
+        if not is_admin(user.id):
+            await query.answer("Not authorized.", show_alert=True)
+            return
+        await query.answer()
+        clear_admin_announce_pending(user.id)
+        await query.message.reply_text(
+            format_start_caption(user.id),
+            reply_markup=main_reply_keyboard(user.id),
+            parse_mode="HTML",
+        )
+        return
+
+    if (
+        data.startswith("cbf|")
+        or data.startswith("clf|")
+        or data.startswith("skf|")
+    ):
+        ensure_user(user.id)
+        parts = data.split("|")
+        if len(parts) != 6:
+            await query.answer("Invalid filter.", show_alert=True)
+            return
+        tag, slug = parts[0], parts[1]
+        try:
+            page = int(parts[2])
+            bi = int(parts[3])
+            kk = int(parts[4])
+            li = int(parts[5])
+        except ValueError:
+            await query.answer("Invalid filter numbers.", show_alert=True)
+            return
+        load_bin_stock()
+        sid = slug_to_section_id(slug)
+        sec = bin_sections_all().get(sid or "") if sid else None
+        if not sid or not sec:
+            await query.answer("That listing expired.", show_alert=True)
+            return
+        raw_lines = list(sec.get("lines") or [])
+        bl, ll = catalog_unique_banks_levels(raw_lines)
+        nu_b = max(1, len(bl) + 1)
+        nu_l = max(1, len(ll) + 1)
+        if tag == "cbf":
+            bi = (bi + 1) % nu_b
+            page = 0
+        elif tag == "clf":
+            li = (li + 1) % nu_l
+            page = 0
+        elif tag == "skf":
+            page = 0
+        text, kb = section_catalog_text_and_keyboard(
+            slug,
+            user.id,
+            page=page,
+            bank_i=bi,
+            kind_k=kk,
+            level_i=li,
+        )
+        await edit_safe(query, text, kb)
+        await query.answer()
+        return
+
+    if data.startswith("bpr:"):
+        ensure_user(user.id)
+        await handle_buy_product(query, user, data, context)
+        return
+    if data.startswith("bpg:"):
+        ensure_user(user.id)
+        await handle_buy_catalog_page(query, user, data, context)
+        return
+    if data.startswith("open_sec:"):
+        ensure_user(user.id)
+        slug = (data.split(":", 1)[1] if ":" in data else "").strip()
+        load_bin_stock()
+        sid = slug_to_section_id(slug)
+        if not sid or sid not in bin_sections_all():
+            await query.answer("Invalid or empty section.", show_alert=True)
+            return
+        text, kb = section_catalog_text_and_keyboard(slug, user.id, page=0)
+        await edit_safe(query, text, kb)
+        await query.answer()
+        return
+    if data == "buy_tier_back":
+        ensure_user(user.id)
+        await edit_safe(
+            query,
+            "💳 <b>Select a BIN section</b>",
+            buy_menu_keyboard(),
+        )
+        await query.answer()
+        return
+
+    if data.startswith("oos:"):
+        ensure_user(user.id)
+        await query.answer(
+            "Out of stock — an admin must add lines with /stock in Telegram.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer()
+    ensure_user(user.id)
+
+    if data == "m_bal":
+        u = ensure_user(user.id)
+        tot = user_shop_balance(u)
+        bal_text = (
+            "💰 <b>My balance</b>\n\n"
+            f"<b>Balance:</b> {fmt_usd(tot)}\n\n"
+            f"Total Deposits: <b>{fmt_usd(u['deposits'])}</b>\n"
+            f"Total Spent: <b>{fmt_usd(u['spent'])}</b>"
+        )
+        await query.message.reply_text(
+            bal_text,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Back", callback_data="bal_back")]]
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    if data == "bal_back":
+        await delete_message_safe(query.message)
+        return
+
+    if data == "m_prof":
+        await query.message.reply_text(
+            profile_html(user),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Back", callback_data="prof_back")]]
+            ),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "prof_back":
+        await delete_message_safe(query.message)
+        return
+
+    if data == "m_top":
+        await query.message.reply_text(
+            TOPUP_TEXT,
+            reply_markup=topup_amount_keyboard(),
+            parse_mode="HTML",
+        )
+        return
+
+    if data == "tu_back":
+        await delete_message_safe(query.message)
+        return
+
+    if data == "tu_custom":
+        await edit_safe(
+            query,
+            "Custom amount: minimum deposit is <b>$10</b>. Please pick a preset.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Back", callback_data="tu_restart")]]
+            ),
+        )
+        return
+
+    if data == "tu_restart":
+        clear_awaiting_tx_link(user.id)
+        clear_awaiting_cashtag(user.id)
+        context.user_data.pop("pay_coin", None)
+        context.user_data.pop("awaiting_tx_link", None)
+        context.user_data.pop("pending_tx_link", None)
+        await edit_safe(query, TOPUP_TEXT, topup_amount_keyboard())
+        return
+
+    topup_map = {
+        "tu_10": 10.0,
+        "tu_100": 100.0,
+        "tu_200": 200.0,
+        "tu_500": 500.0,
+        "tu_1000": 1000.0,
+    }
+    if data in topup_map:
+        amt = topup_map[data]
+        context.user_data["pending_invoice"] = amt
+        context.user_data["pay_source"] = "topup"
+        context.user_data.pop("pay_coin", None)
+        clear_awaiting_tx_link(user.id)
+        clear_awaiting_cashtag(user.id)
+        await edit_safe(query, pay_method_text(amt), pay_method_keyboard())
+        return
+
+    if data.startswith("paybase_pick:") or data in ("base_gtjm", "base_tony"):
+        amt = float(context.user_data.get("pending_invoice") or 0.0)
+        if amt <= 0:
+            await edit_safe(query, TOPUP_TEXT, topup_amount_keyboard())
+        else:
+            await edit_safe(query, pay_method_text(amt), pay_method_keyboard())
+        return
+
+    if data == "base_back":
+        clear_awaiting_tx_link(user.id)
+        clear_awaiting_cashtag(user.id)
+        context.user_data.pop("awaiting_tx_link", None)
+        context.user_data.pop("pending_tx_link", None)
+        if context.user_data.get("pay_source") == "topup":
+            await edit_safe(query, TOPUP_TEXT, topup_amount_keyboard())
+        return
+
+    if data == "m_bases":
+        await query.message.reply_text(
+            "🏦 <b>Payments</b> route to addresses from <code>BTC_WALLET</code>, "
+            "<code>LTC_WALLET</code> (falls back from older BASE_* vars), plus Cash App.",
+            parse_mode="HTML",
+        )
+        return
+
+    if data in ("m_cart", "m_buy"):
+        await query.message.reply_text(
+            "💳 <b>Buy cards</b>\n\n"
+            "Pick BIN + pile · filter by issuer/type/level in the listing view.",
+            reply_markup=buy_menu_keyboard(),
+            parse_mode="HTML",
+        )
+        return
+
+    if data == "buy_back":
+        await delete_message_safe(query.message)
+        return
+
+    if data == "shop_wallet_back":
+        await delete_message_safe(query.message)
+        return
+
+    if data.startswith("shop_wk:") or data in ("shop_jr", "shop_tony"):
+        await edit_safe(
+            query,
+            "💳 <b>Select a BIN section</b>",
+            buy_menu_keyboard(),
+        )
+        return
+
+    if data == "pay_m_back":
+        clear_awaiting_tx_link(user.id)
+        clear_awaiting_cashtag(user.id)
+        context.user_data.pop("awaiting_tx_link", None)
+        context.user_data.pop("pending_tx_link", None)
+        src = context.user_data.get("pay_source")
+        amt = float(context.user_data.get("pending_invoice") or 0.0)
+        if src == "topup":
+            await edit_safe(query, TOPUP_TEXT, topup_amount_keyboard())
+            return
+        if src == "cart":
+            await edit_safe(
+                query,
+                "💳 <b>Select a BIN section</b>",
+                buy_menu_keyboard(),
+            )
+        return
+
+    if data in ("pay_btc", "pay_ltc"):
+        coin = data.replace("pay_", "")
+        context.user_data["pay_coin"] = coin
+        clear_awaiting_cashtag(user.id)
+        amt = float(context.user_data.get("pending_invoice") or 0.0)
+        addrs = shop_deposit_addresses()
+        await edit_safe(
+            query,
+            coin_invoice_text(coin, amt, addrs[coin]),
+            coin_keyboard(),
+        )
+        return
+
+    if data == "pay_cashapp":
+        clear_awaiting_tx_link(user.id)
+        context.user_data.pop("awaiting_tx_link", None)
+        context.user_data.pop("pending_tx_link", None)
+        context.user_data["pay_coin"] = "cashapp"
+        amt = float(context.user_data.get("pending_invoice") or 0.0)
+        mark_awaiting_cashtag(user.id)
+        await edit_safe(
+            query,
+            cashapp_prompt_html(amt),
+            cashtag_cancel_keyboard(),
+        )
+        return
+
+    if data == "pay_cashapp_cancel":
+        clear_awaiting_cashtag(user.id)
+        context.user_data.pop("pay_coin", None)
+        amt = float(context.user_data.get("pending_invoice") or 0.0)
+        await edit_safe(
+            query,
+            pay_method_text(amt),
+            pay_method_keyboard(),
+        )
+        return
+
+    if data == "pay_coin_back":
+        clear_awaiting_tx_link(user.id)
+        clear_awaiting_cashtag(user.id)
+        context.user_data.pop("awaiting_tx_link", None)
+        context.user_data.pop("pending_tx_link", None)
+        amt = float(context.user_data.get("pending_invoice") or 0.0)
+        await edit_safe(
+            query,
+            pay_method_text(amt),
+            pay_method_keyboard(),
+        )
+        return
+    if data == "pay_tx_step":
+        coin = str(context.user_data.get("pay_coin") or "btc")
+        amt = float(context.user_data.get("pending_invoice") or 0.0)
+        clear_awaiting_cashtag(user.id)
+        context.user_data["awaiting_tx_link"] = True
+        context.user_data.pop("pending_tx_link", None)
+        mark_awaiting_tx_link(user.id)
+        await edit_safe(
+            query,
+            "🔗 <b>Transaction link</b>\n\n"
+            f"Invoice: <b>{fmt_usd(amt)} USD</b>\n"
+            f"Coin: <b>{html.escape(coin.upper())}</b>\n\n"
+            "Send <b>one message</b> with a <b>blockchain explorer link</b> to your payment "
+            "(mempool, blockchair, etc.).\n\n"
+            "You’ll see <b>Final submit</b> so admins can accept or reject.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data="pay_tx_cancel")]]
+            ),
+        )
+        return
+
+    if data == "pay_tx_cancel":
+        clear_awaiting_tx_link(user.id)
+        clear_awaiting_cashtag(user.id)
+        context.user_data.pop("awaiting_tx_link", None)
+        context.user_data.pop("pending_tx_link", None)
+        coin = str(context.user_data.get("pay_coin") or "btc")
+        amt = float(context.user_data.get("pending_invoice") or 0.0)
+        addrs = shop_deposit_addresses()
+        await edit_safe(
+            query,
+            coin_invoice_text(coin, amt, addrs[coin]),
+            coin_keyboard(),
+        )
+        return
+
+    if data == "pay_final_submit":
+        tx = (context.user_data.get("pending_tx_link") or "").strip()
+        if not tx:
+            await query.answer(
+                "No TX link saved. Paste an explorer link in chat first.",
+                show_alert=True,
+            )
+            return
+        coin = str(context.user_data.get("pay_coin") or "?")
+        amt = float(context.user_data.get("pending_invoice") or 0.0)
+        src = str(context.user_data.get("pay_source") or "?")
+        claim = add_payment_claim(
+            user, amt, coin, src, payment_base=None, tx_link=tx
+        )
+        await notify_admins_new_claim(context.bot, claim)
+        clear_awaiting_tx_link(user.id)
+        clear_awaiting_cashtag(user.id)
+        context.user_data.pop("awaiting_tx_link", None)
+        context.user_data.pop("pending_tx_link", None)
+        buck = html.escape(shop_credit_display_for_payment(None))
+        await edit_safe(
+            query,
+            "✅ <b>Submitted for review</b>\n\n"
+            f"Claim: <b>#{claim['id']}</b>\n"
+            f"Balance credit if accepted: <b>{buck}</b>\n"
+            "An admin will verify on-chain and accept or reject.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Back", callback_data="pay_done_back")]]
+            ),
+        )
+        return
+
+    if data == "pay_final_cancel":
+        clear_awaiting_tx_link(user.id)
+        clear_awaiting_cashtag(user.id)
+        context.user_data.pop("awaiting_tx_link", None)
+        context.user_data.pop("pending_tx_link", None)
+        coin = str(context.user_data.get("pay_coin") or "btc")
+        amt = float(context.user_data.get("pending_invoice") or 0.0)
+        addrs = shop_deposit_addresses()
+        await edit_safe(
+            query,
+            coin_invoice_text(coin, amt, addrs[coin]),
+            coin_keyboard(),
+        )
+        return
+
+    if data == "pay_done_back":
+        clear_awaiting_tx_link(user.id)
+        clear_awaiting_cashtag(user.id)
+        context.user_data.pop("awaiting_tx_link", None)
+        context.user_data.pop("pending_tx_link", None)
+        context.user_data.pop("pay_coin", None)
+        src = context.user_data.get("pay_source")
+        if src == "topup":
+            await edit_safe(query, TOPUP_TEXT, topup_amount_keyboard())
+        elif src == "cart":
+            await edit_safe(
+                query,
+                "💳 <b>Select a BIN section</b>",
+                buy_menu_keyboard(),
+            )
+        else:
+            await delete_message_safe(query.message)
+        return
+
+
+async def handle_payment_tx_link_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not update.message or not update.effective_user:
+        return
+    uid = update.effective_user.id
+    text = (update.message.text or "").strip()
+    low = text.lower()
+    if not (low.startswith("http://") or low.startswith("https://")):
+        await update.message.reply_text(
+            "Please send a full explorer link starting with "
+            "<code>https://</code> or <code>http://</code>.",
+            parse_mode="HTML",
+        )
+        return
+    context.user_data["pending_tx_link"] = text
+    context.user_data.pop("awaiting_tx_link", None)
+    clear_awaiting_tx_link(uid)
+    amt = float(context.user_data.get("pending_invoice") or 0.0)
+    coin = str(context.user_data.get("pay_coin") or "btc")
+    buck = html.escape(shop_credit_display_for_payment(None))
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Final submit to admins",
+                    callback_data="pay_final_submit",
+                )
+            ],
+            [InlineKeyboardButton("❌ Cancel", callback_data="pay_final_cancel")],
+        ]
+    )
+    await update.message.reply_text(
+        "✅ <b>TX link received</b>\n\n"
+        f"Invoice: <b>{fmt_usd(amt)} USD</b>\n"
+        f"Coin: <b>{html.escape(coin.upper())}</b>\n"
+        f"Balance credit if accepted: <b>{buck}</b>\n\n"
+        f"Link:\n<code>{html.escape(text[:900])}</code>\n\n"
+        "Tap <b>Final submit to admins</b> when ready.",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+
+
+async def handle_payment_cashtag_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Cash App $cashtag — manual admin approval."""
+
+    if not update.message or not update.effective_user:
+        return
+    user = update.effective_user
+    uid = user.id
+    raw = (update.message.text or "").strip()
+    if raw.lower().startswith("http://") or raw.lower().startswith("https://"):
+        mark_awaiting_cashtag(uid)
+        await update.message.reply_text(
+            "You're submitting a <b>Cash App $cashtag</b> here. "
+            "Send something like <code>$YourTag</code>, or tap "
+            "<b>Cancel</b> on the invoice message to use BTC/LTC instead.",
+            parse_mode="HTML",
+        )
+        return
+    tag_body = raw.lstrip("$").strip()
+    if str(context.user_data.get("pay_coin") or "") != "cashapp":
+        clear_awaiting_cashtag(uid)
+        return
+
+    if not _CASHTAG_BODY_RE.match(tag_body):
+        mark_awaiting_cashtag(uid)
+        await update.message.reply_text(
+            "Send a valid Cash App <b>$cashtag</b> "
+            "(letters, numbers, underscore; example: <code>$PluxoShop</code>).",
+            parse_mode="HTML",
+        )
+        return
+    display_tag = f"${tag_body}"
+    amt = float(context.user_data.get("pending_invoice") or 0.0)
+    src = str(context.user_data.get("pay_source") or "topup")
+    clear_awaiting_cashtag(uid)
+    context.user_data.pop("pay_coin", None)
+    claim = add_payment_claim(
+        user,
+        amt,
+        "cashapp",
+        src,
+        payment_base=None,
+        tx_link=display_tag,
+    )
+    await notify_admins_new_claim(context.bot, claim)
+    await update.message.reply_text(
+        "✅ <b>Cashtag received</b>\n\n"
+        f"Claim <b>#{claim['id']}</b> submitted for <b>{fmt_usd(amt)}</b>.\n"
+        f"An admin will verify your Cash App payment and credit your "
+        f"<b>{html.escape(shop_credit_display_for_payment(None))}</b>.\n"
+        "Typical approval: <b>3–10 minutes</b> (EST).",
+        parse_mode="HTML",
+    )
+
+
+def _announce_body(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    msg = update.message
+    if not msg:
+        return None
+    if msg.reply_to_message:
+        r = msg.reply_to_message
+        return (r.text or r.caption or "").strip() or None
+    args = context.args
+    if args:
+        return " ".join(args).strip() or None
+    return None
+
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Not authorized.")
+        return
+    await update.message.reply_text(
+        admin_portal_menu_html(),
+        parse_mode="HTML",
+        reply_markup=admin_portal_keyboard(),
+    )
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Not authorized.")
+        return
+    await update.message.reply_text(
+        f"📊 <b>Broadcast list</b>\n\n"
+        f"Users who used the bot: <b>{len(known_user_ids)}</b>",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    u = update.effective_user
+    admin_ok = is_admin(u.id)
+    await update.message.reply_text(
+        f"👤 <b>Your Telegram user id</b>\n<code>{u.id}</code>\n\n"
+        f"Admin for this bot: <b>{'yes' if admin_ok else 'no'}</b>\n\n"
+        "If that should be <b>yes</b>, add this number to "
+        "<code>ADMIN_USER_IDS</code> in Railway (or .env), comma-separated, then redeploy.",
+        parse_mode="HTML",
+    )
+
+
+async def broadcast_plain_text_to_known_users(
+    bot, body: str
+) -> tuple[int, int]:
+    """DM plain text to every user in known_user_ids (same audience as /announce)."""
+    ok, failed = 0, 0
+    for uid in sorted(known_user_ids):
+        try:
+            await bot.send_message(chat_id=uid, text=body)
+            ok += 1
+            await asyncio.sleep(0.04)
+        except Exception:
+            failed += 1
+            log.info("Broadcast failed for chat_id=%s", uid, exc_info=True)
+    return ok, failed
+
+
+async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Not authorized.")
+        return
+    if not ADMIN_USER_IDS:
+        await update.message.reply_text(
+            "Set <code>ADMIN_USER_IDS</code> in <code>.env</code> first.",
+            parse_mode="HTML",
+        )
+        return
+    body = _announce_body(update, context)
+    if not body:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/announce Your message here…\n"
+            "Or reply to a message and send /announce (sends that message’s text).",
+            parse_mode="HTML",
+        )
+        return
+    if not known_user_ids:
+        await update.message.reply_text("No subscribers yet (nobody has used /start).")
+        return
+    await update.message.reply_text(
+        f"Sending to <b>{len(known_user_ids)}</b> users…",
+        parse_mode="HTML",
+    )
+    ok, failed = await broadcast_plain_text_to_known_users(context.bot, body)
+    await update.message.reply_text(
+        f"✅ Delivered: <b>{ok}</b>\n❌ Failed: <b>{failed}</b>",
+        parse_mode="HTML",
+    )
+
+
+async def handle_admin_announce_broadcast(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """After admin taps 📢 Announcement, deliver their next text to all known users."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user or not msg.text:
+        return
+    body = msg.text.strip()
+    if not body:
+        await msg.reply_text("Send non-empty text, or <code>/cancel</code>.", parse_mode="HTML")
+        return
+    clear_admin_announce_pending(user.id)
+    if not known_user_ids:
+        await msg.reply_text("No users yet (nobody has used /start).")
+        return
+    await msg.reply_text(
+        f"Sending to <b>{len(known_user_ids)}</b> users…",
+        parse_mode="HTML",
+    )
+    ok, failed = await broadcast_plain_text_to_known_users(context.bot, body)
+    await msg.reply_text(
+        f"✅ Delivered: <b>{ok}</b>\n❌ Failed: <b>{failed}</b>",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_payportal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Not authorized.")
+        return
+    await update.message.reply_text(payment_portal_html(), parse_mode="HTML")
+
+
+async def cmd_pendingclaims(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Not authorized.")
+        return
+    lines = [format_claim_oneline(c) for c in list_pending_claims(30)]
+    body = "\n".join(lines) if lines else "<i>No pending claims.</i>"
+    await update.message.reply_text(
+        "⏳ <b>Pending payment claims</b>\n\n" + body,
+        parse_mode="HTML",
+    )
+
+
+async def cmd_allclaims(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Not authorized.")
+        return
+    lim = 30
+    if context.args:
+        try:
+            lim = max(1, min(80, int(context.args[0])))
+        except ValueError:
+            pass
+    lines = [format_claim_oneline(c) for c in list_recent_claims(lim)]
+    body = "\n".join(lines) if lines else "<i>No claims yet.</i>"
+    await update.message.reply_text(
+        f"📋 <b>Recent claims</b> (last {lim})\n\n" + body,
+        parse_mode="HTML",
+    )
+
+
+async def cmd_accept(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Not authorized.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /accept &lt;claim_id&gt;", parse_mode="HTML"
+        )
+        return
+    try:
+        cid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Claim id must be a number.")
+        return
+    ok, msg, claim = apply_claim_resolution(cid, "accepted", update.effective_user.id)
+    if ok and claim:
+        await update.message.reply_text(claim_detail_html(claim), parse_mode="HTML")
+    else:
+        await update.message.reply_text(html.escape(msg), parse_mode="HTML")
+
+
+async def start_admin_stock_wizard(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg or not is_admin(user.id):
+        return
+    clear_admin_stock_flow(context, user.id)
+    mark_admin_stock_wizard(user.id)
+    context.user_data["admin_stock_step"] = "bin"
+    await msg.reply_text(
+        admin_stock_wizard_step1_intro(),
+        parse_mode="HTML",
+        reply_markup=admin_stock_reply_keyboard(),
+    )
+
+
+async def handle_admin_stock_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user or not msg.text:
+        return
+    step = context.user_data.get("admin_stock_step")
+    text = msg.text.strip()
+
+    if step == "bin":
+        bk = "".join(c for c in text if c.isdigit())[:6]
+        if len(bk) != 6:
+            await msg.reply_text(
+                "Send exactly <b>6 digits</b> for the BIN.", parse_mode="HTML"
+            )
+            return
+        context.user_data["stock_flow_bin"] = bk
+        context.user_data["admin_stock_step"] = "pile"
+        await msg.reply_text(
+            f"📦 <b>Step 2</b> — BIN <code>{html.escape(bk)}</code>\n\n"
+            "Choose <b>Live</b> or <b>Unchecked</b> pile, or type "
+            "<code>live</code> / <code>unchecked</code>:",
+            parse_mode="HTML",
+            reply_markup=admin_stock_pile_keyboard(),
+        )
+        return
+
+    if step == "pile":
+        low = text.lower()
+        pile: str | None = None
+        if low in ("live", "l"):
+            pile = PILE_LIVE
+        elif low in ("unchecked", "u", "unverified"):
+            pile = PILE_UNCHECKED
+        if not pile:
+            await msg.reply_text(
+                "Tap a pile button or send <code>live</code> / <code>unchecked</code>.",
+                parse_mode="HTML",
+            )
+            return
+        context.user_data["stock_flow_pile"] = pile
+        context.user_data["admin_stock_step"] = "price"
+        await msg.reply_text(
+            "📦 <b>Step 3</b> — Price per line\n\n"
+            "Send a number, e.g. <code>2.25</code> or <code>8</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if step == "price":
+        praw = text.lstrip("$").replace(",", "")
+        try:
+            price = float(praw)
+        except ValueError:
+            await msg.reply_text(
+                "Invalid price. Send a number like <code>8</code>.",
+                parse_mode="HTML",
+            )
+            return
+        if price < 0:
+            await msg.reply_text("Price must be ≥ 0.")
+            return
+        context.user_data["stock_flow_price"] = price
+        context.user_data["admin_stock_step"] = "tag"
+        await msg.reply_text(
+            "📦 <b>Step 4</b> — Batch tag (banner)\n\n"
+            "Shown after “→” on the upload card (try <code>BLACKJACK🃏</code>). "
+            "Send <code>-</code> for <b>Goatys🐐</b>.",
+            parse_mode="HTML",
+        )
+        return
+
+    if step == "tag":
+        tag = text.strip()
+        if tag.lower() in ("-", "—", "none", "na", "n/a"):
+            tag = "Goatys🐐"
+        tag = tag[:80]
+        bin6 = (context.user_data.get("stock_flow_bin") or "").strip()[:6]
+        pile = (context.user_data.get("stock_flow_pile") or PILE_LIVE).strip().lower()
+        if pile not in VALID_PILES:
+            pile = PILE_LIVE
+        section_id = f"{bin6}:{pile}"
+        context.user_data["stock_flow_batch_label"] = tag
+        context.user_data["stock_flow_section_id"] = section_id
+        context.user_data["stock_flow_pending_lines"] = []
+        context.user_data["admin_stock_step"] = "buffer"
+        price = float(context.user_data["stock_flow_price"])
+        await msg.reply_text(
+            stock_buffer_started_html(price, bin6, pile, tag),
+            parse_mode="HTML",
+        )
+        return
+
+    if step == "buffer":
+        raw_lines = [ln for ln in (msg.text or "").splitlines() if ln.strip()]
+        if not raw_lines:
+            await msg.reply_text("Paste at least one non-empty line.")
+            return
+        bin_sec = (context.user_data.get("stock_flow_bin") or "").strip()[:6]
+        pending = list(context.user_data.get("stock_flow_pending_lines") or [])
+        errors: list[str] = []
+        new_rows: list[str] = []
+        for raw in raw_lines:
+            pl, err = parse_stock_line_to_pipe(raw, bin_sec)
+            if err:
+                errors.append(
+                    f"(after {len(pending) + len(new_rows)} ok lines) paste error: {err}"
+                )
+            elif pl:
+                new_rows.append(pl)
+        if errors:
+            err_tail = "\n".join(errors[:5])
+            extra = (
+                f"\n… +{len(errors) - 5} more" if len(errors) > 5 else ""
+            )
+            await msg.reply_text(err_tail + extra, parse_mode="HTML")
+            return
+        pending.extend(new_rows)
+        context.user_data["stock_flow_pending_lines"] = pending
+        n = len(pending)
+        await msg.reply_text(
+            f"<b>Buffered</b> <code>{n}</code> line(s). "
+            "Paste more, or send <code>/done</code> to commit.",
+            parse_mode="HTML",
+        )
+        return
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    uid = update.effective_user.id
+    if uid in _awaiting_cashtag_user_ids:
+        clear_awaiting_cashtag(uid)
+        context.user_data.pop("pay_coin", None)
+        await update.message.reply_text(
+            "Cash App cashtag step cancelled. Open <b>Top Up</b> again if needed.",
+            parse_mode="HTML",
+        )
+        return
+    if not is_admin(uid):
+        await update.message.reply_text("Nothing to cancel.")
+        return
+    parts: list[str] = []
+    if uid in _admin_announce_pending_ids:
+        clear_admin_announce_pending(uid)
+        parts.append("Announcement cancelled.")
+    if uid in _admin_stock_wizard_user_ids:
+        clear_admin_stock_flow(context, uid)
+        parts.append("Stock wizard cancelled.")
+    if parts:
+        await update.message.reply_text(" ".join(parts))
+        return
+    await update.message.reply_text("Nothing to cancel.")
+
+
+async def cmd_stock_done(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Commit buffered /stock lines."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user or not is_admin(user.id):
+        if msg and user and not is_admin(user.id):
+            await msg.reply_text("⛔ Admin only.")
+        return
+    if context.user_data.get("admin_stock_step") != "buffer":
+        await msg.reply_text(
+            "No batch is waiting. Start with <code>/stock</code>.",
+            parse_mode="HTML",
+        )
+        return
+    pending = list(context.user_data.get("stock_flow_pending_lines") or [])
+    if not pending:
+        await msg.reply_text("Buffer is empty — paste lines first.")
+        return
+    section_id = str(context.user_data.get("stock_flow_section_id") or "").strip()
+    sid = normalize_section_id(section_id)
+    if not sid:
+        await msg.reply_text("Internal error — bad section. Cancel and retry.")
+        return
+    price = float(context.user_data.get("stock_flow_price") or 0.0)
+    pile_part = sid.split(":", 1)[1]
+    load_bin_stock()
+    sections_map = bin_sections_all()
+    sec = sections_map.setdefault(
+        sid,
+        {
+            "price_usd": price,
+            "lines": [],
+            "listing_notes": "",
+            "pile": pile_part,
+        },
+    )
+    sec["price_usd"] = float(price)
+    for line in pending:
+        sec["lines"].append(line)
+    sort_stock_lines(sec["lines"])
+    save_bin_stock()
+    ntot = len(sec["lines"])
+    added = len(pending)
+    clear_admin_stock_flow(context, user.id)
+    await msg.reply_text(
+        "✅ <b>Stock committed</b> · "
+        f"<code>{html.escape(sid)}</code>\n"
+        f"{fmt_usd(price)} per line · <b>{added}</b> line(s) added · "
+        f"<b>{ntot}</b> total in section.",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_cancelstock(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not update.message or not update.effective_user:
+        return
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    if uid not in _admin_stock_wizard_user_ids:
+        await update.message.reply_text("No stock wizard running.")
+        return
+    clear_admin_stock_flow(context, uid)
+    await update.message.reply_text("Stock upload aborted.")
+
+
+async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: add one pipe-line to a BIN section with a price (per line in shop)."""
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    args = context.args or []
+    if len(args) == 0:
+        await start_admin_stock_wizard(update, context)
+        return
+    if args[0].lower() != "bin":
+        await update.message.reply_text(
+            "Usage (admin):\n"
+            "<code>/stock</code> — BIN → pile → price → tag → paste → <code>/done</code>\n"
+            "<code>/stock bin [legacy_slug] BIN $price PAN MM/YY CVV</code>\n"
+            "<i>(quick one-liner goes to the LIVE pile)</i>\n\n",
+            parse_mode="HTML",
+        )
+        return
+
+    idx, leg_note = _consume_optional_legacy_stock_slug(args, 1)
+    need = 5
+    if len(args) - idx < need:
+        await update.message.reply_text(
+            "Need: <code>/stock bin [optional_slug] BIN $price PAN MM/YY CVV</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    bin_sec = args[idx].strip()[:6]
+    idx += 1
+    if len(bin_sec) != 6 or not bin_sec.isdigit():
+        await update.message.reply_text("BIN must be exactly 6 digits.")
+        return
+
+    praw = args[idx].strip().lstrip("$").replace(",", "")
+    idx += 1
+    try:
+        price = float(praw)
+    except ValueError:
+        await update.message.reply_text(
+            "Invalid price. Use e.g. <code>$8</code> or <code>8</code>.",
+            parse_mode="HTML",
+        )
+        return
+    if price < 0:
+        await update.message.reply_text("Price must be ≥ 0.")
+        return
+
+    pan_raw = args[idx].strip()
+    idx += 1
+    digits_pan = "".join(c for c in pan_raw if c.isdigit())
+    if len(digits_pan) < 13:
+        await update.message.reply_text("PAN should have at least 13 digits.")
+        return
+
+    exp_part = args[idx].strip()
+    idx += 1
+    cvv = args[idx].strip()
+    idx += 1
+
+    if idx != len(args):
+        await update.message.reply_text(
+            f"Trailing extra tokens: <code>{html.escape(' '.join(args[idx:][:8]))}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if "/" not in exp_part:
+        await update.message.reply_text(
+            "Expiry must look like <code>06/29</code> (MM/YY).",
+            parse_mode="HTML",
+        )
+        return
+    mm, yy = exp_part.split("/", 1)
+    mm = mm.strip().zfill(2)
+    yy = yy.strip()
+    if len(yy) == 4:
+        yy = yy[2:]
+    yy = yy.zfill(2)[:2]
+    line = f"{digits_pan}|{mm}|{yy}|{cvv}|?|?|?|?|?|US|?|?|?"
+    quick_sid = f"{bin_sec}:{PILE_LIVE}"
+    load_bin_stock()
+    sec = bin_sections_all().setdefault(
+        quick_sid,
+        {
+            "price_usd": float(price),
+            "lines": [],
+            "listing_notes": "",
+            "pile": PILE_LIVE,
+        },
+    )
+    sec["price_usd"] = float(price)
+    sec["lines"].append(line)
+    sort_stock_lines(sec["lines"])
+    save_bin_stock()
+    n = len(sec["lines"])
+    footer = leg_note or ""
+    await update.message.reply_text(
+        "✅ <b>Stock added</b> · section "
+        f"<code>{html.escape(quick_sid)}</code> · "
+        f"{fmt_usd(price)} per line · <b>{n}</b> line(s)."
+        f"{footer}",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Not authorized.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /reject &lt;claim_id&gt;", parse_mode="HTML"
+        )
+        return
+    try:
+        cid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Claim id must be a number.")
+        return
+    ok, msg, claim = apply_claim_resolution(cid, "rejected", update.effective_user.id)
+    if ok and claim:
+        await update.message.reply_text(claim_detail_html(claim), parse_mode="HTML")
+    else:
+        await update.message.reply_text(html.escape(msg), parse_mode="HTML")
+
+
+_conflict_log_at: float = 0.0
+
+
+async def error_handler(_update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _conflict_log_at
+    err = context.error
+    if isinstance(err, ApplicationHandlerStop):
+        return
+    if isinstance(err, Conflict):
+        now = time.monotonic()
+        if now - _conflict_log_at >= 45.0:
+            _conflict_log_at = now
+            log.error(
+                "Telegram 409 Conflict: another process is polling this bot (mixed 200/409 in logs). "
+                "Only ONE getUpdates client allowed. Check: PC running bot.py; a second Railway "
+                "service/env with the same TELEGRAM_BOT_TOKEN; replicas > 1; staging+production "
+                "both running. Stop extras, then /revoke token if it leaked."
+            )
+        return
+    log.exception("Unhandled exception in handler", exc_info=err)
+
+
+def main() -> None:
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    if not token:
+        raise SystemExit(
+            "TELEGRAM_BOT_TOKEN is missing. Local: copy .env.example to .env and set it. "
+            "Railway / Docker: add variable TELEGRAM_BOT_TOKEN on the service (Deploy → Variables); "
+            "a machine .env file is never shipped in the image."
+        )
+    app = Application.builder().token(token).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", start))
+    # Main reply keyboard must run before wizard handlers (same group) so menu taps
+    # are not eaten as BIN / cashtag text.
+    app.add_handler(MessageHandler(REPLY_MAIN_MENU_FILTER, handle_main_reply_menu))
+    app.add_handler(CommandHandler("myid", cmd_myid))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("announce", cmd_announce))
+    app.add_handler(CommandHandler("payportal", cmd_payportal))
+    app.add_handler(CommandHandler("pendingclaims", cmd_pendingclaims))
+    app.add_handler(CommandHandler("allclaims", cmd_allclaims))
+    app.add_handler(CommandHandler("accept", cmd_accept))
+    app.add_handler(CommandHandler("reject", cmd_reject))
+    app.add_handler(CommandHandler("stock", cmd_stock))
+    app.add_handler(CommandHandler("done", cmd_stock_done))
+    app.add_handler(CommandHandler("cancelstock", cmd_cancelstock))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(
+        MessageHandler(ADMIN_STOCK_WIZARD_FILTER, handle_admin_stock_message)
+    )
+    app.add_handler(
+        MessageHandler(ADMIN_ANNOUNCE_FILTER, handle_admin_announce_broadcast)
+    )
+    app.add_handler(
+        MessageHandler(AWAITING_CASHTAG_FILTER, handle_payment_cashtag_message)
+    )
+    app.add_handler(
+        MessageHandler(AWAITING_TX_LINK_FILTER, handle_payment_tx_link_message)
+    )
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_error_handler(error_handler)
+    if not ADMIN_USER_IDS:
+        log.warning("ADMIN_USER_IDS is empty — set it in .env to use /admin and /announce")
+    log.info("Bot running — press Ctrl+C to stop")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
