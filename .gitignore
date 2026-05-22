@@ -1,7 +1,0 @@
-.env
-venv/
-.venv/
-__pycache__/
-*.pyc
-data/known_users.json
-data/payments.json
